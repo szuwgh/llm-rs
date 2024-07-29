@@ -10,6 +10,7 @@ use std::io::Read;
 use thiserror::Error;
 type Endian = LittleEndian;
 use galois::DType;
+use galois::Shape;
 use galois::Tensor;
 use galois::GS_BLCK_SIZE;
 use galois::GS_TYPE_SIZE;
@@ -116,6 +117,130 @@ enum EModel {
     MODEL_70B,
 }
 
+struct TensorContext<'a> {
+    offset: usize,
+    size: usize,
+    n_objects: usize,
+    buf: &'a [u8],
+}
+
+impl<'a> TensorContext<'a> {
+    fn new(buf: &'a [u8]) -> TensorContext<'a> {
+        TensorContext {
+            offset: 0,
+            size: 0,
+            n_objects: 0,
+            buf: buf,
+        }
+    }
+}
+
+fn new_tensor_1d(ctx: &mut TensorContext, dtype: DType, ne0: usize) -> LLMResult<Tensor> {
+    let dim = [ne0];
+    new_tensor(ctx, 1, dtype, Shape::from_array(dim))
+}
+
+fn new_tensor_2d(
+    ctx: &mut TensorContext,
+    dtype: DType,
+    ne0: usize,
+    ne1: usize,
+) -> LLMResult<Tensor> {
+    let dim = [ne0, ne1];
+    new_tensor(ctx, 2, dtype, Shape::from_array(dim))
+}
+
+fn new_tensor_3d(
+    ctx: &mut TensorContext,
+    dtype: DType,
+    ne0: usize,
+    ne1: usize,
+    ne2: usize,
+) -> LLMResult<Tensor> {
+    let dim = [ne0, ne1, ne2];
+    new_tensor(ctx, 3, dtype, Shape::from_array(dim))
+}
+
+fn new_tensor_4d(
+    ctx: &mut TensorContext,
+    dtype: DType,
+    ne0: usize,
+    ne1: usize,
+    ne3: usize,
+    ne4: usize,
+) -> LLMResult<Tensor> {
+    let dim = [ne0, ne1];
+    new_tensor(ctx, 2, dtype, Shape::from_array(dim))
+}
+
+fn new_f32_tensor(ctx: &mut TensorContext, value: f32) -> LLMResult<Tensor> {
+    let mut result = new_tensor_1d(ctx, DType::F32, 1)?;
+    result.set_value(value);
+    Ok(result)
+}
+
+fn new_tensor(
+    ctx: &mut TensorContext,
+    n_dims: usize,
+    dtype: DType,
+    shape: Shape,
+) -> LLMResult<Tensor> {
+    let cur_offset = ctx.offset;
+    let cur_size = ctx.size;
+    let size_needed: usize = get_type_size(dtype) * shape.size();
+    if cur_offset + size_needed > ctx.buf.len() {
+        return Err(LLMError::NotEnoughSpace);
+    }
+    let t = unsafe {
+        Tensor::from_bytes(
+            &ctx.buf[cur_offset..cur_offset + size_needed],
+            n_dims,
+            shape,
+            dtype,
+        )
+    };
+    ctx.offset = cur_offset + size_needed;
+    ctx.size = size_needed;
+    ctx.n_objects += 1;
+    Ok(t)
+}
+
+fn view_tensor(buf: &[u8], n_dims: usize, dtype: DType, shape: Shape) -> LLMResult<Tensor> {
+    Ok(unsafe { Tensor::from_bytes(buf, n_dims, shape, dtype) })
+}
+
+fn dup_tensor(ctx: &mut TensorContext, a: &Tensor) -> LLMResult<Tensor> {
+    let dtype = a.dtype();
+    let shape = Shape::from_slice(a.dim().shape());
+    new_tensor(ctx, a.n_dims(), dtype, shape)
+}
+
+fn view_1d(a: &Tensor, ne0: usize, offset: usize) -> LLMResult<Tensor> {
+    let dtype = a.dtype();
+    let buf = a.as_bytes();
+    let shape = Shape::from_array([ne0]);
+    view_tensor(&buf[offset..], 1, dtype, shape)
+}
+
+fn view_2d(a: &Tensor, ne0: usize, ne1: usize, nb1: usize, offset: usize) -> LLMResult<Tensor> {
+    let dtype = a.dtype();
+    let buf = a.as_bytes();
+    let shape = Shape::from_array([ne0, ne1]);
+    let mut t = view_tensor(&buf[offset..], 2, dtype, shape)?;
+    let nb0 = t.dim().stride_1d();
+    let nb = [nb0, nb1, nb1 * ne1, nb1 * ne1];
+    t.ret_stride(nb);
+    Ok(t)
+}
+
+fn reshape_3d(a: &Tensor, ne0: usize, ne1: usize, ne2: usize) -> LLMResult<Tensor> {
+    assert!(a.ggml_is_contiguous());
+    assert!(a.elem_count() == ne0 * ne1 * ne2);
+    let ne: [usize; 3] = [ne0, ne1, ne2];
+    let result = view_tensor(a.as_bytes(), a.n_dims(), a.dtype(), Shape::from_array(ne))?;
+    Ok(result)
+}
+
 type Id = i32;
 type Token = String;
 
@@ -192,6 +317,25 @@ struct LlamaModel {
     hparams: LlamaHparams,
 }
 
+struct LlamaLayer {
+    // normalization
+    attention_norm: Tensor,
+
+    // attention
+    wq: Tensor,
+    wk: Tensor,
+    wv: Tensor,
+    wo: Tensor,
+
+    // normalization
+    ffn_norm: Tensor,
+
+    // ff
+    w1: Tensor,
+    w2: Tensor,
+    w3: Tensor,
+}
+
 impl LlamaHparams {
     fn load<T: Read + BufRead>(r: &mut T) -> LLMResult<LlamaHparams> {
         let n_vocab: i32 = r.read_i32::<Endian>()?;
@@ -225,6 +369,7 @@ impl LlamaHparams {
 impl LlamaModel {
     fn load<T: Read + BufRead>(r: &mut T) -> LLMResult<LlamaModel> {
         let hparams = LlamaHparams::load(r)?;
+        GptVocab::load(r, hparams.n_vocab)?;
         let wtype = match hparams.f16 {
             0 => DType::F32,
             1 => DType::F16,
@@ -276,18 +421,17 @@ impl LlamaModel {
                 ctx_size / (1024.0 * 1024.0),
             );
         }
-        let mut tensors: HashMap<String, *mut Tensor> = HashMap::new();
 
-        let mut tensor_ctx = TensorContext::new(buf_model);
-        let n_vocab = hparams.n_vocab as usize;
-        let n_audio_ctx = hparams.n_audio_ctx as usize;
-        let n_audio_state = hparams.n_audio_state as usize;
-        let n_audio_layer = hparams.n_audio_layer as usize;
+        let mut buf_model = vec![0u8; ctx_size as usize];
+        {
+            let mut tensors: HashMap<String, *mut Tensor> = HashMap::new();
+            let mut tensor_ctx = TensorContext::new(&mut buf_model);
+            let n_embd = hparams.n_embd;
+            let n_layer = hparams.n_layer;
+            let n_ctx = hparams.n_ctx;
+            let n_vocab = hparams.n_vocab;
+        }
 
-        let n_text_ctx = hparams.n_text_ctx as usize;
-        let n_text_state = hparams.n_text_state as usize;
-        let n_text_layer = hparams.n_text_layer as usize;
-        let n_mels = hparams.n_mels as usize;
         // let wtype = if hparams.f16 == 1 {
         //     DType::F16
         // } else {
