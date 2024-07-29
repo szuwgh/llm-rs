@@ -10,7 +10,30 @@ use std::io::Read;
 use thiserror::Error;
 type Endian = LittleEndian;
 use galois::DType;
+use galois::Tensor;
+use galois::GS_BLCK_SIZE;
+use galois::GS_TYPE_SIZE;
+use lazy_static::lazy_static;
 use std::fs::File;
+
+fn get_type_size(t: DType) -> usize {
+    return GS_TYPE_SIZE[t as usize];
+}
+
+fn get_type_sizef(t: DType) -> f32 {
+    return (GS_TYPE_SIZE[t as usize]) as f32 / GS_BLCK_SIZE[t as usize] as f32;
+}
+
+lazy_static! {
+    static ref LLAMA_N_PARTS: HashMap<i32, usize> = {
+        let mut map = HashMap::new();
+        map.insert(4096, 1);
+        map.insert(5120, 2);
+        map.insert(6656, 4);
+        map.insert(8192, 8);
+        map
+    };
+}
 
 macro_rules! function {
     () => {{
@@ -200,7 +223,7 @@ impl LlamaHparams {
 }
 
 impl LlamaModel {
-    fn load<T: Read + BufRead>(r: &mut T, mtype: EModel) -> LLMResult<LlamaModel> {
+    fn load<T: Read + BufRead>(r: &mut T) -> LLMResult<LlamaModel> {
         let hparams = LlamaHparams::load(r)?;
         let wtype = match hparams.f16 {
             0 => DType::F32,
@@ -210,8 +233,61 @@ impl LlamaModel {
                 todo!()
             }
         };
+        let n_ff = (((2 * (4 * hparams.n_embd) / 3 + hparams.n_mult - 1) / hparams.n_mult)
+            * hparams.n_mult) as f32;
+        let n_parts = LLAMA_N_PARTS.get(&hparams.n_embd).unwrap();
+        println!("{}: n_ff      = {}", function!(), n_ff);
+        println!("{}: n_parts   = {}", function!(), n_parts);
         let wtype2 = DType::F32;
-        let mut ctx_mem_size = 0usize;
+        let mut ctx_size = 0.0f32;
+        {
+            let n_embd = hparams.n_embd as f32;
+            let n_layer = hparams.n_layer as f32;
+            let n_ctx = hparams.n_ctx as f32;
+            let n_vocab = hparams.n_vocab as f32;
+
+            ctx_size += n_embd * n_vocab * get_type_sizef(wtype); // tok_embeddings
+
+            ctx_size += n_embd * get_type_sizef(DType::F32); // norm
+
+            ctx_size += n_embd * n_vocab * get_type_sizef(wtype); // output
+
+            ctx_size += n_layer * (n_embd * get_type_sizef(DType::F32)); // attention_norm
+
+            ctx_size += n_layer * (n_embd * n_embd * get_type_sizef(wtype)); // wq
+            ctx_size += n_layer * (n_embd * n_embd * get_type_sizef(wtype)); // wk
+            ctx_size += n_layer * (n_embd * n_embd * get_type_sizef(wtype)); // wv
+            ctx_size += n_layer * (n_embd * n_embd * get_type_sizef(wtype)); // wo
+
+            ctx_size += n_layer * (n_embd * get_type_sizef(DType::F32)); // ffn_norm
+
+            ctx_size += n_layer * (n_ff * n_embd * get_type_sizef(wtype)); // w1
+            ctx_size += n_layer * (n_ff * n_embd * get_type_sizef(wtype)); // w2
+            ctx_size += n_layer * (n_ff * n_embd * get_type_sizef(wtype)); // w3
+
+            ctx_size += n_ctx * n_layer * n_embd * get_type_sizef(DType::F32); // memory_k
+            ctx_size += n_ctx * n_layer * n_embd * get_type_sizef(DType::F32); // memory_v
+
+            ctx_size += (5.0 + 10.0 * n_layer) * 256.0; // object overhead
+
+            println!(
+                "{}: ctx size = {:6.2} MB\n",
+                function!(),
+                ctx_size / (1024.0 * 1024.0),
+            );
+        }
+        let mut tensors: HashMap<String, *mut Tensor> = HashMap::new();
+
+        let mut tensor_ctx = TensorContext::new(buf_model);
+        let n_vocab = hparams.n_vocab as usize;
+        let n_audio_ctx = hparams.n_audio_ctx as usize;
+        let n_audio_state = hparams.n_audio_state as usize;
+        let n_audio_layer = hparams.n_audio_layer as usize;
+
+        let n_text_ctx = hparams.n_text_ctx as usize;
+        let n_text_state = hparams.n_text_state as usize;
+        let n_text_layer = hparams.n_text_layer as usize;
+        let n_mels = hparams.n_mels as usize;
         // let wtype = if hparams.f16 == 1 {
         //     DType::F16
         // } else {
@@ -255,6 +331,6 @@ fn open_file_stream(fname: &str) -> LLMResult<BufReader<File>> {
 }
 
 fn main() {
-    let model_path = "/opt/cproject/llama.cpp-master-d3f202d/models/ggml-model-Q4.bin";
+    let model_path = "/opt/cproject/models/ggml-model-Q4.bin";
     LLMContext::new(&model_path).unwrap();
 }
