@@ -17,6 +17,10 @@ use galois::GS_TYPE_SIZE;
 use lazy_static::lazy_static;
 use std::fs::File;
 
+fn get_blck_size(t: DType) -> usize {
+    return GS_BLCK_SIZE[t as usize];
+}
+
 fn get_type_size(t: DType) -> usize {
     return GS_TYPE_SIZE[t as usize];
 }
@@ -72,6 +76,8 @@ pub enum LLMError {
     WrongBytesTensor(String, usize, usize),
     #[error("galois tensor:'{0}'")]
     WrongGTensor(GError),
+    #[error(" unknown ftype '{0}' in model file")]
+    UnknownFtypeGTensor(i32),
 }
 
 impl From<IOError> for LLMError {
@@ -241,27 +247,27 @@ fn reshape_3d(a: &Tensor, ne0: usize, ne1: usize, ne2: usize) -> LLMResult<Tenso
     Ok(result)
 }
 
-type Id = i32;
+type GptVocabId = i32;
 type Token = String;
 
 struct GptVocab {
     n_vocab: i32,
-    token_to_id: HashMap<Token, Id>,
-    id_to_token: HashMap<Id, Token>,
+    token_to_id: HashMap<Token, GptVocabId>,
+    id_to_token: HashMap<GptVocabId, Token>,
 }
 
 impl GptVocab {
     fn load<T: Read + BufRead>(r: &mut T, n_vocab: i32) -> LLMResult<GptVocab> {
-        let mut token_to_id: HashMap<Token, Id> = HashMap::new();
-        let mut id_to_token: HashMap<Id, Token> = HashMap::new();
+        let mut token_to_id: HashMap<Token, GptVocabId> = HashMap::new();
+        let mut id_to_token: HashMap<GptVocabId, Token> = HashMap::new();
         for i in 0..n_vocab {
             let len: u32 = r.read_u32::<Endian>()?;
             let mut tmp = vec![0; len as usize];
             r.read_exact(&mut tmp)?;
             let word = String::from_utf8_lossy(&tmp).to_string();
-            if i == 50256 {
-                println!("{}: vocab[{}] =       = {}\n", function!(), i, word);
-            }
+            // if i == 1111 {
+            //     println!("{}: vocab[{}] =       = {}\n", function!(), i, word);
+            // }
             token_to_id.insert(word.clone(), i);
             id_to_token.insert(i, word);
         }
@@ -313,8 +319,22 @@ impl Default for LlamaHparams {
 }
 
 struct LlamaModel {
-    mtype: EModel,
+    //mtype: EModel,
     hparams: LlamaHparams,
+
+    tok_embeddings: Tensor,
+
+    norm: Tensor,
+    output: Tensor,
+
+    layers: Vec<LlamaLayer>,
+
+    // key + value memory
+    memory_k: Tensor,
+    memory_v: Tensor,
+    //
+    // struct ggml_context * ctx;
+    // std::map<std::string, struct ggml_tensor *> tensors;
 }
 
 struct LlamaLayer {
@@ -367,9 +387,9 @@ impl LlamaHparams {
 }
 
 impl LlamaModel {
-    fn load<T: Read + BufRead>(r: &mut T) -> LLMResult<LlamaModel> {
-        let hparams = LlamaHparams::load(r)?;
-        GptVocab::load(r, hparams.n_vocab)?;
+    fn load<T: Read + BufRead>(r: &mut T, hparams: LlamaHparams) -> LLMResult<LlamaModel> {
+        // let hparams = LlamaHparams::load(r)?;
+        // GptVocab::load(r, hparams.n_vocab)?;
         let wtype = match hparams.f16 {
             0 => DType::F32,
             1 => DType::F16,
@@ -421,23 +441,320 @@ impl LlamaModel {
                 ctx_size / (1024.0 * 1024.0),
             );
         }
+        let mut tensors: HashMap<String, *mut Tensor> = HashMap::new();
 
         let mut buf_model = vec![0u8; ctx_size as usize];
-        {
+        let model = {
             let mut tensors: HashMap<String, *mut Tensor> = HashMap::new();
             let mut tensor_ctx = TensorContext::new(&mut buf_model);
-            let n_embd = hparams.n_embd;
-            let n_layer = hparams.n_layer;
-            let n_ctx = hparams.n_ctx;
-            let n_vocab = hparams.n_vocab;
-        }
+            let n_embd = hparams.n_embd as usize;
+            let n_layer = hparams.n_layer as usize;
+            let n_ctx = hparams.n_ctx as usize;
+            let n_vocab = hparams.n_vocab as usize;
 
+            let mut layers: Vec<LlamaLayer> = Vec::with_capacity(n_layer);
+
+            let mut tok_embeddings = new_tensor_2d(&mut tensor_ctx, wtype, n_embd, n_vocab)?;
+            let mut norm = new_tensor_1d(&mut tensor_ctx, DType::F32, n_embd)?;
+            let mut output = new_tensor_2d(&mut tensor_ctx, wtype, n_embd, n_vocab)?;
+
+            tensors.insert(
+                "tok_embeddings.weight".to_string(),
+                &mut tok_embeddings as *mut Tensor,
+            );
+            tensors.insert("norm.weight".to_string(), &mut norm as *mut Tensor);
+            tensors.insert("output.weight".to_string(), &mut output as *mut Tensor);
+
+            for i in 0..n_layer {
+                let attention_norm = new_tensor_1d(&mut tensor_ctx, DType::F32, n_embd)?;
+
+                let wq = new_tensor_2d(&mut tensor_ctx, wtype, n_embd, n_embd)?;
+                let wk = new_tensor_2d(&mut tensor_ctx, wtype, n_embd, n_embd)?;
+                let wv = new_tensor_2d(&mut tensor_ctx, wtype, n_embd, n_embd)?;
+                let wo = new_tensor_2d(&mut tensor_ctx, wtype, n_embd, n_embd)?;
+
+                let ffn_norm = new_tensor_1d(&mut tensor_ctx, DType::F32, n_embd)?;
+
+                let w1 = new_tensor_2d(&mut tensor_ctx, wtype, n_embd, n_ff as usize)?;
+                let w2 = new_tensor_2d(&mut tensor_ctx, wtype, n_ff as usize, n_embd)?;
+                let w3 = new_tensor_2d(&mut tensor_ctx, wtype, n_embd, n_ff as usize)?;
+                layers.push(LlamaLayer {
+                    attention_norm,
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    ffn_norm,
+                    w1,
+                    w2,
+                    w3,
+                });
+
+                let layer = layers.last_mut().unwrap();
+
+                tensors.insert(
+                    format!("layers.{}.attention_norm.weight", i),
+                    &mut layer.attention_norm as *mut Tensor,
+                );
+
+                tensors.insert(
+                    format!("layers.{}.attention.wq.weight", i),
+                    &mut layer.wq as *mut Tensor,
+                );
+                tensors.insert(
+                    format!("layers.{}.attention.wk.weight", i),
+                    &mut layer.wk as *mut Tensor,
+                );
+                tensors.insert(
+                    format!("layers.{}.attention.wv.weight", i),
+                    &mut layer.wv as *mut Tensor,
+                );
+                tensors.insert(
+                    format!("layers.{}.attention.wo.weight", i),
+                    &mut layer.wo as *mut Tensor,
+                );
+
+                tensors.insert(
+                    format!("layers.{}.ffn_norm.weight", i),
+                    &mut layer.ffn_norm as *mut Tensor,
+                );
+
+                tensors.insert(
+                    format!("layers.{}.feed_forward.w1.weight", i),
+                    &mut layer.w1 as *mut Tensor,
+                );
+                tensors.insert(
+                    format!("layers.{}.feed_forward.w2.weight", i),
+                    &mut layer.w2 as *mut Tensor,
+                );
+                tensors.insert(
+                    format!("layers.{}.feed_forward.w3.weight", i),
+                    &mut layer.w3 as *mut Tensor,
+                );
+            }
+
+            let n_embd = hparams.n_embd as usize;
+            let n_layer = hparams.n_layer as usize;
+            let n_ctx = hparams.n_ctx as usize;
+            let n_vocab = hparams.n_vocab as usize;
+
+            let n_mem = n_layer * n_ctx;
+            let n_elements = n_embd * n_mem;
+
+            let memory_k = new_tensor_1d(&mut tensor_ctx, DType::F32, n_elements)?;
+            let memory_v = new_tensor_1d(&mut tensor_ctx, DType::F32, n_elements)?;
+            let memory_size = memory_k.nbytes() + memory_v.nbytes();
+            println!(
+                "{}: memory_size = {:8.2} MB, n_mem = {}",
+                function!(),
+                memory_size as f32 / 1024.0 / 1024.0,
+                n_mem,
+            );
+            LlamaModel {
+                hparams,
+                tok_embeddings,
+                norm,
+                output,
+                layers,
+                // key + value memory
+                memory_k,
+                memory_v,
+            }
+        };
+        {
+            let mut total_size: usize = 0;
+            let j: usize = 0;
+            loop {
+                let n_dims = r.read_i32::<Endian>()?;
+                let length = r.read_i32::<Endian>()?;
+                let ftype = r.read_i32::<Endian>()?;
+
+                let mut nelements: usize = 1;
+                let mut ne: [usize; 2] = [1, 1];
+                // let n_dims = 3; // Assume this value is set appropriately
+                // println!("n_dims:{}", n_dims);
+                for i in 0..n_dims as usize {
+                    ne[i] = r.read_i32::<Endian>()? as usize;
+                    nelements *= ne[i];
+                }
+                //  println!("nelements:{}", nelements);
+                let mut buffer = vec![0; length as usize];
+                r.read_exact(&mut buffer)?;
+                let name = String::from_utf8_lossy(&buffer).to_string();
+                let ref_tensor = tensors
+                    .get_mut(name.as_str())
+                    .ok_or(LLMError::UnknownTensor(name.clone()))?;
+
+                if let Some(tensor) = unsafe { (*ref_tensor).as_mut() } {
+                    let split_type = if name.contains("tok_embeddings") {
+                        0
+                    } else if name.contains("layers") {
+                        if name.contains("attention.wo.weight") {
+                            0
+                        } else if name.contains("feed_forward.w2.weight") {
+                            0
+                        } else {
+                            1
+                        }
+                    } else if name.contains("output") {
+                        1
+                    } else {
+                        // Define a default split_type if needed
+                        // For instance, if none of the conditions match
+                        // you can decide what to return
+                        0
+                    };
+
+                    if (n_dims == 1) {
+                        if tensor.elem_count() != nelements {
+                            return Err(LLMError::WrongSizeTensor(
+                                name,
+                                tensor.elem_count(),
+                                nelements,
+                            ));
+                        }
+                    } else {
+                        if tensor.elem_count() / n_parts != nelements {
+                            return Err(LLMError::WrongSizeTensor(
+                                name,
+                                tensor.elem_count(),
+                                nelements,
+                            ));
+                        }
+                    }
+                    let (ne0, ne1) = tensor.dim2();
+                    if (n_dims == 1) {
+                        if (ne0 != ne[0] || ne1 != ne[1]) {
+                            return Err(LLMError::WrongShapeTensor(
+                                name,
+                                vec![ne0, ne1],
+                                ne.to_vec(),
+                            ));
+                        }
+                    } else {
+                        if (split_type == 0) {
+                            if (ne0 / n_parts != ne[0] || ne1 != ne[1]) {
+                                return Err(LLMError::WrongShapeTensor(
+                                    name,
+                                    vec![ne0, ne1],
+                                    ne.to_vec(),
+                                ));
+                            }
+                        } else {
+                            if (ne0 != ne[0] || ne1 / n_parts != ne[1]) {
+                                return Err(LLMError::WrongShapeTensor(
+                                    name,
+                                    vec![ne0, ne1],
+                                    ne.to_vec(),
+                                ));
+                            }
+                        }
+                    }
+
+                    let bpe = match ftype {
+                        0 => get_type_size(DType::F32),
+                        1 => get_type_size(DType::F16),
+                        2 => {
+                            assert!(ne[0] % 64 == 0);
+                            get_type_size(DType::Q4_0)
+                        }
+                        _ => {
+                            return Err(LLMError::UnknownFtypeGTensor(ftype));
+                        }
+                    };
+
+                    if (nelements * bpe) / get_blck_size(tensor.dtype()) != tensor.nbytes() {
+                        return Err(LLMError::WrongShapeTensor(
+                            name,
+                            vec![ne0, ne1],
+                            ne.to_vec(),
+                        ));
+                    }
+                    r.read_exact(tensor.as_bytes_mut())?;
+                    //fin.read(reinterpret_cast<char *>(tensor->data), ggml_nbytes(tensor));
+                    // if (part_id == 0) {
+                    //     fin.read(reinterpret_cast<char *>(tensor->data), ggml_nbytes(tensor));
+                    // } else {
+                    //     fin.seekg(ggml_nbytes(tensor), std::ios::cur);
+                    // }
+
+                    // if tensor.elem_count() != nelements {
+                    //     return Err(LLMError::WrongSizeTensor(
+                    //         name,
+                    //         tensor.elem_count(),
+                    //         nelements,
+                    //     ));
+                    // }
+                    // let shape = tensor.dim().shape();
+                    // for i in 0..shape.len() {
+                    //     if shape[i] != ne[i] {
+                    //         return Err(LLMError::WrongShapeTensor(
+                    //             name,
+                    //             shape.to_vec(),
+                    //             ne.to_vec(),
+                    //         ));
+                    //     }
+                    // }
+                    // let bpe = if ftype == 0 {
+                    //     std::mem::size_of::<f32>()
+                    // } else {
+                    //     std::mem::size_of::<galois::F16>()
+                    // };
+                    // if nelements * bpe != tensor.nbytes() {
+                    //     return Err(LLMError::WrongBytesTensor(
+                    //         name,
+                    //         tensor.nbytes(),
+                    //         nelements * bpe,
+                    //     ));
+                    // }
+                    // {
+                    //     // let mut x = vec![0u8; tensor.as_bytes_mut().len()];
+                    //     r.read_exact(tensor.as_bytes_mut())?;
+                    // }
+                    // if name == "encoder.blocks.0.attn.query.weight".to_string() {
+                    //     let x: &[F16] = unsafe { tensor.as_slice::<F16>() };
+                    //     let mut sum: f64 = 0.0;
+                    //     for i in 0..x.len() {
+                    //         sum += x[i].abs().to_f64();
+                    //         if i < 10 || i > tensor.elem_count() - 10 {
+                    //             print!("{:?},", x[i])
+                    //         }
+                    //     }
+                    //     println!(
+                    //         "encoder.blocks.0.attn.query.weight:{:?},shape:{:?},stride:{:?}",
+                    //         sum,
+                    //         tensor.shape(),
+                    //         tensor.dim().stride_4d()
+                    //     );
+                    // }
+
+                    // println!("name:{},{}", name, tensor.as_bytes_mut().len());
+
+                    total_size += tensor.nbytes();
+                    // whisper_mode.n_loaded += 1;
+                    match r.fill_buf() {
+                        Ok(r) => {
+                            if r.len() < 12 {
+                                break;
+                            }
+                        }
+                        Err(e) => match e.kind() {
+                            std::io::ErrorKind::UnexpectedEof => break,
+                            _ => return Err(LLMError::UnexpectIO(e)),
+                        },
+                    }
+                } else {
+                    println!("break");
+                    return Err(LLMError::BadRefTensor(name));
+                }
+            }
+        }
         // let wtype = if hparams.f16 == 1 {
         //     DType::F16
         // } else {
         //     DType::F32
         // };
-        todo!()
+        Ok(model)
     }
 }
 
@@ -460,7 +777,7 @@ impl LLMContext {
         if magic != GGML_MAGIC {
             return Err(LLMError::BadMagic(fname.to_string()));
         }
-        LlamaModel::load(&mut fin)?;
+
         // let version = file.read_u32::<Endian>()?;
 
         todo!()
@@ -474,7 +791,84 @@ fn open_file_stream(fname: &str) -> LLMResult<BufReader<File>> {
     Ok(buf_reader)
 }
 
-fn main() {
+const MAX_TOKEN_LEN: usize = 18;
+
+fn llama_tokenize(vocab: &GptVocab, text: &str, bos: bool) -> Vec<GptVocabId> {
+    let mut res: Vec<GptVocabId> = Vec::new();
+    let mut score: Vec<usize> = Vec::new();
+    let mut prev: Vec<GptVocabId> = Vec::new();
+    let len = text.len();
+
+    score.resize(len + 1, 0);
+    prev.resize(len + 1, 0);
+
+    for i in 0..len {
+        let max_len = std::cmp::min(len - i, MAX_TOKEN_LEN);
+        for sub_len in 1..=max_len {
+            let sub = &text[i..i + sub_len];
+            if let Some(&token_id) = vocab.token_to_id.get(sub) {
+                let token_score = sub.len() * sub.len();
+                let local_score = score[i] + token_score;
+                let next = i + sub_len;
+                if score[next] < local_score {
+                    score[next] = local_score;
+                    prev[next] = token_id;
+                }
+            }
+        }
+    }
+
+    let mut i = len;
+    while i > 0 {
+        let token_id = prev[i];
+        if token_id == 0 {
+            // TODO: Return error or something more meaningful
+            eprintln!("failed to tokenize string!");
+            break;
+        }
+        res.push(token_id);
+
+        if let Some(token) = vocab.id_to_token.get(&token_id) {
+            i -= token.len();
+        } else {
+            // Handle the case where token_id is not found in the vocabulary
+            eprintln!("token_id not found in vocabulary!");
+            break;
+        }
+    }
+
+    if bos {
+        res.push(1); // TODO: replace with vocab.bos
+    }
+
+    // Pieces are in reverse order so correct that
+    res.reverse();
+
+    return res;
+}
+
+fn main() -> LLMResult<()> {
     let model_path = "/opt/cproject/models/ggml-model-Q4.bin";
-    LLMContext::new(&model_path).unwrap();
+    let mut fin = open_file_stream(model_path)?;
+    let magic = fin.read_u32::<Endian>()?;
+    if magic != GGML_MAGIC {
+        return Err(LLMError::BadMagic(model_path.to_string()));
+    }
+    // LLMContext::new(&model_path).unwrap();
+    let hparams = LlamaHparams::load(&mut fin)?;
+    let vocab = GptVocab::load(&mut fin, hparams.n_vocab)?;
+    let mut prompt = String::from("Building a website can be done in 10 simple steps:");
+    prompt.insert(0, ' ');
+    let embd_inp = llama_tokenize(&vocab, &prompt, true);
+    println!("{}: prompt: '{}'", function!(), prompt);
+    println!(
+        "{}: number of tokens in prompt = {}",
+        function!(),
+        embd_inp.len(),
+    );
+    for inp in embd_inp.iter() {
+        println!("{} -> '{}'\n", inp, vocab.id_to_token.get(inp).unwrap());
+    }
+    LlamaModel::load(&mut fin, hparams)?;
+    Ok(())
 }
