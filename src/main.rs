@@ -185,6 +185,7 @@ fn new_f32_tensor(ctx: &mut TensorContext, value: f32) -> LLMResult<Tensor> {
     Ok(result)
 }
 
+const GGML_MEM_ALIGN: usize = 16;
 fn new_tensor(
     ctx: &mut TensorContext,
     n_dims: usize,
@@ -193,7 +194,17 @@ fn new_tensor(
 ) -> LLMResult<Tensor> {
     let cur_offset = ctx.offset;
     let cur_size = ctx.size;
-    let size_needed: usize = get_type_size(dtype) * shape.size();
+    let ne = shape.layout();
+    let mut size_needed: usize = get_type_size(dtype) * (ne[0] / get_blck_size(dtype));
+    for i in 1..n_dims {
+        size_needed *= ne[i];
+    }
+    size_needed = ((size_needed + GGML_MEM_ALIGN - 1) / GGML_MEM_ALIGN) * GGML_MEM_ALIGN;
+    // println!(
+    //     "size_needed:{},get_type_sizef(dtype):{}",
+    //     size_needed,
+    //     get_type_sizef(dtype) as usize
+    // );
     if cur_offset + size_needed > ctx.buf.len() {
         return Err(LLMError::NotEnoughSpace);
     }
@@ -400,7 +411,7 @@ impl LlamaModel {
         };
         let n_ff = (((2 * (4 * hparams.n_embd) / 3 + hparams.n_mult - 1) / hparams.n_mult)
             * hparams.n_mult) as f32;
-        let n_parts = LLAMA_N_PARTS.get(&hparams.n_embd).unwrap();
+        let n_parts = *LLAMA_N_PARTS.get(&hparams.n_embd).unwrap();
         println!("{}: n_ff      = {}", function!(), n_ff);
         println!("{}: n_parts   = {}", function!(), n_parts);
         let wtype2 = DType::F32;
@@ -445,7 +456,6 @@ impl LlamaModel {
 
         let mut buf_model = vec![0u8; ctx_size as usize];
         let model = {
-            let mut tensors: HashMap<String, *mut Tensor> = HashMap::new();
             let mut tensor_ctx = TensorContext::new(&mut buf_model);
             let n_embd = hparams.n_embd as usize;
             let n_layer = hparams.n_layer as usize;
@@ -478,6 +488,7 @@ impl LlamaModel {
                 let w1 = new_tensor_2d(&mut tensor_ctx, wtype, n_embd, n_ff as usize)?;
                 let w2 = new_tensor_2d(&mut tensor_ctx, wtype, n_ff as usize, n_embd)?;
                 let w3 = new_tensor_2d(&mut tensor_ctx, wtype, n_embd, n_ff as usize)?;
+
                 layers.push(LlamaLayer {
                     attention_norm,
                     wq,
@@ -572,7 +583,7 @@ impl LlamaModel {
                 let mut nelements: usize = 1;
                 let mut ne: [usize; 2] = [1, 1];
                 // let n_dims = 3; // Assume this value is set appropriately
-                // println!("n_dims:{}", n_dims);
+                println!("n_dims:{}", n_dims);
                 for i in 0..n_dims as usize {
                     ne[i] = r.read_i32::<Endian>()? as usize;
                     nelements *= ne[i];
@@ -581,6 +592,7 @@ impl LlamaModel {
                 let mut buffer = vec![0; length as usize];
                 r.read_exact(&mut buffer)?;
                 let name = String::from_utf8_lossy(&buffer).to_string();
+                println!("name:{}", name);
                 let ref_tensor = tensors
                     .get_mut(name.as_str())
                     .ok_or(LLMError::UnknownTensor(name.clone()))?;
@@ -605,7 +617,7 @@ impl LlamaModel {
                         0
                     };
 
-                    if (n_dims == 1) {
+                    if n_dims == 1 {
                         if tensor.elem_count() != nelements {
                             return Err(LLMError::WrongSizeTensor(
                                 name,
@@ -623,8 +635,8 @@ impl LlamaModel {
                         }
                     }
                     let (ne0, ne1) = tensor.dim2();
-                    if (n_dims == 1) {
-                        if (ne0 != ne[0] || ne1 != ne[1]) {
+                    if n_dims == 1 {
+                        if ne0 != ne[0] || ne1 != ne[1] {
                             return Err(LLMError::WrongShapeTensor(
                                 name,
                                 vec![ne0, ne1],
@@ -632,19 +644,19 @@ impl LlamaModel {
                             ));
                         }
                     } else {
-                        if (split_type == 0) {
-                            if (ne0 / n_parts != ne[0] || ne1 != ne[1]) {
+                        if split_type == 0 {
+                            if ne0 / n_parts != ne[0] || ne1 != ne[1] {
                                 return Err(LLMError::WrongShapeTensor(
                                     name,
-                                    vec![ne0, ne1],
+                                    vec![ne0 / n_parts, ne1],
                                     ne.to_vec(),
                                 ));
                             }
                         } else {
-                            if (ne0 != ne[0] || ne1 / n_parts != ne[1]) {
+                            if ne0 != ne[0] || (ne1 / n_parts) != ne[1] {
                                 return Err(LLMError::WrongShapeTensor(
                                     name,
-                                    vec![ne0, ne1],
+                                    vec![ne0, ne1 / n_parts],
                                     ne.to_vec(),
                                 ));
                             }
@@ -664,10 +676,10 @@ impl LlamaModel {
                     };
 
                     if (nelements * bpe) / get_blck_size(tensor.dtype()) != tensor.nbytes() {
-                        return Err(LLMError::WrongShapeTensor(
+                        return Err(LLMError::WrongBytesTensor(
                             name,
-                            vec![ne0, ne1],
-                            ne.to_vec(),
+                            (nelements * bpe) / get_blck_size(tensor.dtype()),
+                            tensor.nbytes(),
                         ));
                     }
                     r.read_exact(tensor.as_bytes_mut())?;
@@ -749,6 +761,7 @@ impl LlamaModel {
                 }
             }
         }
+        println!("success");
         // let wtype = if hparams.f16 == 1 {
         //     DType::F16
         // } else {
