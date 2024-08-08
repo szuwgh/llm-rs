@@ -7,8 +7,10 @@ use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Error as IOError;
 use std::io::Read;
+use std::process::exit;
 use thiserror::Error;
 type Endian = LittleEndian;
+use galois::ggml_quants::BlockQ4_0;
 use galois::DType;
 use galois::Shape;
 use galois::Tensor;
@@ -186,6 +188,7 @@ fn new_f32_tensor(ctx: &mut TensorContext, value: f32) -> LLMResult<Tensor> {
 }
 
 const GGML_MEM_ALIGN: usize = 16;
+
 fn new_tensor(
     ctx: &mut TensorContext,
     n_dims: usize,
@@ -256,6 +259,12 @@ fn reshape_3d(a: &Tensor, ne0: usize, ne1: usize, ne2: usize) -> LLMResult<Tenso
     let ne: [usize; 3] = [ne0, ne1, ne2];
     let result = view_tensor(a.as_bytes(), a.n_dims(), a.dtype(), Shape::from_array(ne))?;
     Ok(result)
+}
+
+fn get_rows(ctx: &mut TensorContext, a: &Tensor, b: &Tensor) -> LLMResult<Tensor> {
+    let mut dst = new_tensor_2d(ctx, DType::F32, a.dim1(), b.dim1())?;
+    galois::op::galois_get_rows(a, b, &mut dst)?;
+    Ok(dst)
 }
 
 type GptVocabId = i32;
@@ -398,9 +407,11 @@ impl LlamaHparams {
 }
 
 impl LlamaModel {
-    fn load<T: Read + BufRead>(r: &mut T, hparams: LlamaHparams) -> LLMResult<LlamaModel> {
-        // let hparams = LlamaHparams::load(r)?;
-        // GptVocab::load(r, hparams.n_vocab)?;
+    fn load<T: Read + BufRead>(
+        r: &mut T,
+        hparams: LlamaHparams,
+        buf_model: &mut [u8],
+    ) -> LLMResult<LlamaModel> {
         let wtype = match hparams.f16 {
             0 => DType::F32,
             1 => DType::F16,
@@ -411,52 +422,13 @@ impl LlamaModel {
         };
         let n_ff = (((2 * (4 * hparams.n_embd) / 3 + hparams.n_mult - 1) / hparams.n_mult)
             * hparams.n_mult) as f32;
-        let n_parts = *LLAMA_N_PARTS.get(&hparams.n_embd).unwrap();
-        println!("{}: n_ff      = {}", function!(), n_ff);
-        println!("{}: n_parts   = {}", function!(), n_parts);
-        let wtype2 = DType::F32;
-        let mut ctx_size = 0.0f32;
-        {
-            let n_embd = hparams.n_embd as f32;
-            let n_layer = hparams.n_layer as f32;
-            let n_ctx = hparams.n_ctx as f32;
-            let n_vocab = hparams.n_vocab as f32;
-
-            ctx_size += n_embd * n_vocab * get_type_sizef(wtype); // tok_embeddings
-
-            ctx_size += n_embd * get_type_sizef(DType::F32); // norm
-
-            ctx_size += n_embd * n_vocab * get_type_sizef(wtype); // output
-
-            ctx_size += n_layer * (n_embd * get_type_sizef(DType::F32)); // attention_norm
-
-            ctx_size += n_layer * (n_embd * n_embd * get_type_sizef(wtype)); // wq
-            ctx_size += n_layer * (n_embd * n_embd * get_type_sizef(wtype)); // wk
-            ctx_size += n_layer * (n_embd * n_embd * get_type_sizef(wtype)); // wv
-            ctx_size += n_layer * (n_embd * n_embd * get_type_sizef(wtype)); // wo
-
-            ctx_size += n_layer * (n_embd * get_type_sizef(DType::F32)); // ffn_norm
-
-            ctx_size += n_layer * (n_ff * n_embd * get_type_sizef(wtype)); // w1
-            ctx_size += n_layer * (n_ff * n_embd * get_type_sizef(wtype)); // w2
-            ctx_size += n_layer * (n_ff * n_embd * get_type_sizef(wtype)); // w3
-
-            ctx_size += n_ctx * n_layer * n_embd * get_type_sizef(DType::F32); // memory_k
-            ctx_size += n_ctx * n_layer * n_embd * get_type_sizef(DType::F32); // memory_v
-
-            ctx_size += (5.0 + 10.0 * n_layer) * 256.0; // object overhead
-
-            println!(
-                "{}: ctx size = {:6.2} MB\n",
-                function!(),
-                ctx_size / (1024.0 * 1024.0),
-            );
-        }
+        // let hparams = LlamaHparams::load(r)?;
+        // GptVocab::load(r, hparams.n_vocab)?;
+        let n_parts = 1;
         let mut tensors: HashMap<String, *mut Tensor> = HashMap::new();
 
-        let mut buf_model = vec![0u8; ctx_size as usize];
         let model = {
-            let mut tensor_ctx = TensorContext::new(&mut buf_model);
+            let mut tensor_ctx = TensorContext::new(buf_model);
             let n_embd = hparams.n_embd as usize;
             let n_layer = hparams.n_layer as usize;
             let n_ctx = hparams.n_ctx as usize;
@@ -556,10 +528,11 @@ impl LlamaModel {
             let memory_v = new_tensor_1d(&mut tensor_ctx, DType::F32, n_elements)?;
             let memory_size = memory_k.nbytes() + memory_v.nbytes();
             println!(
-                "{}: memory_size = {:8.2} MB, n_mem = {}",
+                "{}: memory_size = {:8.2} MB, n_mem = {},offset={}",
                 function!(),
                 memory_size as f32 / 1024.0 / 1024.0,
                 n_mem,
+                tensor_ctx.offset,
             );
             LlamaModel {
                 hparams,
@@ -583,7 +556,7 @@ impl LlamaModel {
                 let mut nelements: usize = 1;
                 let mut ne: [usize; 2] = [1, 1];
                 // let n_dims = 3; // Assume this value is set appropriately
-                println!("n_dims:{}", n_dims);
+                print!(".");
                 for i in 0..n_dims as usize {
                     ne[i] = r.read_i32::<Endian>()? as usize;
                     nelements *= ne[i];
@@ -592,7 +565,7 @@ impl LlamaModel {
                 let mut buffer = vec![0; length as usize];
                 r.read_exact(&mut buffer)?;
                 let name = String::from_utf8_lossy(&buffer).to_string();
-                println!("name:{}", name);
+                // println!("name:{}", name);
                 let ref_tensor = tensors
                     .get_mut(name.as_str())
                     .ok_or(LLMError::UnknownTensor(name.clone()))?;
@@ -683,64 +656,22 @@ impl LlamaModel {
                         ));
                     }
                     r.read_exact(tensor.as_bytes_mut())?;
-                    //fin.read(reinterpret_cast<char *>(tensor->data), ggml_nbytes(tensor));
-                    // if (part_id == 0) {
-                    //     fin.read(reinterpret_cast<char *>(tensor->data), ggml_nbytes(tensor));
-                    // } else {
-                    //     fin.seekg(ggml_nbytes(tensor), std::ios::cur);
-                    // }
-
-                    // if tensor.elem_count() != nelements {
-                    //     return Err(LLMError::WrongSizeTensor(
-                    //         name,
-                    //         tensor.elem_count(),
-                    //         nelements,
-                    //     ));
-                    // }
-                    // let shape = tensor.dim().shape();
-                    // for i in 0..shape.len() {
-                    //     if shape[i] != ne[i] {
-                    //         return Err(LLMError::WrongShapeTensor(
-                    //             name,
-                    //             shape.to_vec(),
-                    //             ne.to_vec(),
-                    //         ));
-                    //     }
-                    // }
-                    // let bpe = if ftype == 0 {
-                    //     std::mem::size_of::<f32>()
-                    // } else {
-                    //     std::mem::size_of::<galois::F16>()
-                    // };
-                    // if nelements * bpe != tensor.nbytes() {
-                    //     return Err(LLMError::WrongBytesTensor(
-                    //         name,
-                    //         tensor.nbytes(),
-                    //         nelements * bpe,
-                    //     ));
-                    // }
-                    // {
-                    //     // let mut x = vec![0u8; tensor.as_bytes_mut().len()];
-                    //     r.read_exact(tensor.as_bytes_mut())?;
-                    // }
-                    // if name == "encoder.blocks.0.attn.query.weight".to_string() {
-                    //     let x: &[F16] = unsafe { tensor.as_slice::<F16>() };
+                    // println!("name:{},nbytes:{}", name, tensor.as_bytes_mut().len());
+                    // if name == "tok_embeddings.weight".to_string() {
+                    //     let x: &[BlockQ4_0] = unsafe { tensor.as_slice::<BlockQ4_0>() };
                     //     let mut sum: f64 = 0.0;
-                    //     for i in 0..x.len() {
-                    //         sum += x[i].abs().to_f64();
-                    //         if i < 10 || i > tensor.elem_count() - 10 {
-                    //             print!("{:?},", x[i])
-                    //         }
+                    //     for i in 0..tensor.elem_count() {
+                    //         sum += x[i].d().abs() as f64;
                     //     }
                     //     println!(
-                    //         "encoder.blocks.0.attn.query.weight:{:?},shape:{:?},stride:{:?}",
+                    //         "tok_embeddings,sum:{:?},sha
+                    //         pe:{:?},stride:{:?}",
                     //         sum,
-                    //         tensor.shape(),
+                    //         tensor.ggml_shape(),
                     //         tensor.dim().stride_4d()
                     //     );
+                    //     //exit(1);
                     // }
-
-                    // println!("name:{},{}", name, tensor.as_bytes_mut().len());
 
                     total_size += tensor.nbytes();
                     // whisper_mode.n_loaded += 1;
@@ -762,11 +693,6 @@ impl LlamaModel {
             }
         }
         println!("success");
-        // let wtype = if hparams.f16 == 1 {
-        //     DType::F16
-        // } else {
-        //     DType::F32
-        // };
         Ok(model)
     }
 }
@@ -860,8 +786,129 @@ fn llama_tokenize(vocab: &GptVocab, text: &str, bos: bool) -> Vec<GptVocabId> {
     return res;
 }
 
+fn llama_eval(model: &LlamaModel, embd_inp: &[GptVocabId], mem_per_token: usize) -> LLMResult<()> {
+    let N = embd_inp.len();
+    let hparams = &model.hparams;
+
+    let n_embd = hparams.n_embd;
+    let n_layer = hparams.n_layer;
+    let n_ctx = hparams.n_ctx;
+    let n_head = hparams.n_head;
+    let n_vocab = hparams.n_vocab;
+    let n_rot = hparams.n_embd / hparams.n_head;
+    let d_key = n_embd / n_head;
+
+    let buf_size = 512 * 1024 * 1024;
+    let mut buf: Vec<u8> = vec![0u8; buf_size];
+    let mut tensor_ctx = TensorContext::new(&mut buf);
+
+    let mut embd = new_tensor_1d(&mut tensor_ctx, DType::I32, N)?;
+
+    unsafe {
+        embd.as_slice_mut::<i32>().copy_from_slice(embd_inp);
+    }
+
+    let x: &[i32] = unsafe { embd.as_slice::<i32>() };
+    let mut sum: f64 = 0.0;
+    for i in 0..embd.elem_count() {
+        sum += x[i].abs() as f64;
+    }
+    println!(
+        "embd,sum:{:?},sha
+        pe:{:?},stride:{:?}",
+        sum,
+        embd.ggml_shape(),
+        embd.dim().stride_4d()
+    );
+
+    let inp = get_rows(&mut tensor_ctx, &model.tok_embeddings, &embd)?;
+
+    // let x: &[BlockQ4_0] = unsafe { model.tok_embeddings.as_slice::<BlockQ4_0>() };
+    let mut sum: f64 = 0.0;
+    // for i in 0..model.tok_embeddings.elem_count() {
+    //     if x[i].d().is_nan() {
+    //         sum += x[i].d().abs() as f64;
+    //     }
+    // }
+    println!(
+        "tok_embeddings,sum:{:?},shape:{:?},stride:{:?}",
+        sum,
+        model.tok_embeddings.ggml_shape(),
+        model.tok_embeddings.dim().stride_4d()
+    );
+
+    let x: &[f32] = unsafe { inp.as_slice::<f32>() };
+    let mut sum: f64 = 0.0;
+    for i in 0..inp.elem_count() {
+        sum += x[i].abs() as f64;
+    }
+    println!(
+        "k1,sum:{:?},sha
+        pe:{:?},stride:{:?}",
+        sum,
+        inp.ggml_shape(),
+        inp.dim().stride_4d()
+    );
+    Ok(())
+}
+
+fn compute_ctx_size(hparams: &LlamaHparams) -> usize {
+    let wtype = match hparams.f16 {
+        0 => DType::F32,
+        1 => DType::F16,
+        2 => DType::Q4_0,
+        _ => {
+            todo!()
+        }
+    };
+    let n_ff = (((2 * (4 * hparams.n_embd) / 3 + hparams.n_mult - 1) / hparams.n_mult)
+        * hparams.n_mult) as f32;
+    let n_parts = *LLAMA_N_PARTS.get(&hparams.n_embd).unwrap();
+    println!("{}: n_ff      = {}", function!(), n_ff);
+    println!("{}: n_parts   = {}", function!(), n_parts);
+    let wtype2 = DType::F32;
+    let mut ctx_size = 0.0f32;
+    {
+        let n_embd = hparams.n_embd as f32;
+        let n_layer = hparams.n_layer as f32;
+        let n_ctx = hparams.n_ctx as f32;
+        let n_vocab = hparams.n_vocab as f32;
+
+        ctx_size += n_embd * n_vocab * get_type_sizef(wtype); // tok_embeddings
+
+        ctx_size += n_embd * get_type_sizef(DType::F32); // norm
+
+        ctx_size += n_embd * n_vocab * get_type_sizef(wtype); // output
+
+        ctx_size += n_layer * (n_embd * get_type_sizef(DType::F32)); // attention_norm
+
+        ctx_size += n_layer * (n_embd * n_embd * get_type_sizef(wtype)); // wq
+        ctx_size += n_layer * (n_embd * n_embd * get_type_sizef(wtype)); // wk
+        ctx_size += n_layer * (n_embd * n_embd * get_type_sizef(wtype)); // wv
+        ctx_size += n_layer * (n_embd * n_embd * get_type_sizef(wtype)); // wo
+
+        ctx_size += n_layer * (n_embd * get_type_sizef(DType::F32)); // ffn_norm
+
+        ctx_size += n_layer * (n_ff * n_embd * get_type_sizef(wtype)); // w1
+        ctx_size += n_layer * (n_ff * n_embd * get_type_sizef(wtype)); // w2
+        ctx_size += n_layer * (n_ff * n_embd * get_type_sizef(wtype)); // w3
+
+        ctx_size += n_ctx * n_layer * n_embd * get_type_sizef(DType::F32); // memory_k
+        ctx_size += n_ctx * n_layer * n_embd * get_type_sizef(DType::F32); // memory_v
+
+        ctx_size += (5.0 + 10.0 * n_layer) * 256.0; // object overhead
+
+        println!(
+            "{}: ctx size = {:6.2} MB\n",
+            function!(),
+            ctx_size / (1024.0 * 1024.0),
+        );
+    }
+    return ctx_size as usize;
+}
+
 fn main() -> LLMResult<()> {
-    let model_path = "/opt/cproject/models/ggml-model-Q4.bin";
+    let model_path = "E:\\cproject\\models\\ggml-model-Q4.bin";
     let mut fin = open_file_stream(model_path)?;
     let magic = fin.read_u32::<Endian>()?;
     if magic != GGML_MAGIC {
@@ -882,6 +929,11 @@ fn main() -> LLMResult<()> {
     for inp in embd_inp.iter() {
         println!("{} -> '{}'\n", inp, vocab.id_to_token.get(inp).unwrap());
     }
-    LlamaModel::load(&mut fin, hparams)?;
+    let ctx_size = compute_ctx_size(&hparams);
+    let mut buf_model = vec![0u8; ctx_size as usize];
+    let model = LlamaModel::load(&mut fin, hparams, &mut buf_model)?;
+    llama_eval(&model, &[0, 1, 2, 3], 0)?;
+    drop(buf_model);
+    drop(model);
     Ok(())
 }
