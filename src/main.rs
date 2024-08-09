@@ -7,10 +7,8 @@ use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Error as IOError;
 use std::io::Read;
-use std::process::exit;
 use thiserror::Error;
 type Endian = LittleEndian;
-use galois::ggml_quants::BlockQ4_0;
 use galois::DType;
 use galois::Shape;
 use galois::Tensor;
@@ -267,6 +265,12 @@ fn get_rows(ctx: &mut TensorContext, a: &Tensor, b: &Tensor) -> LLMResult<Tensor
     Ok(dst)
 }
 
+fn rms_norm(ctx: &mut TensorContext, a: &Tensor) -> LLMResult<Tensor> {
+    let mut dst = dup_tensor(ctx, a)?;
+    galois::op::galois_rms_norm(a, &mut dst)?;
+    Ok(dst)
+}
+
 type GptVocabId = i32;
 type Token = String;
 
@@ -415,7 +419,7 @@ impl LlamaModel {
         let wtype = match hparams.f16 {
             0 => DType::F32,
             1 => DType::F16,
-            2 => DType::Q4_0,
+            2 => DType::Q4V1_0,
             _ => {
                 todo!()
             }
@@ -641,7 +645,7 @@ impl LlamaModel {
                         1 => get_type_size(DType::F16),
                         2 => {
                             assert!(ne[0] % 64 == 0);
-                            get_type_size(DType::Q4_0)
+                            get_type_size(DType::Q4V1_0)
                         }
                         _ => {
                             return Err(LLMError::UnknownFtypeGTensor(ftype));
@@ -672,7 +676,6 @@ impl LlamaModel {
                     //     );
                     //     //exit(1);
                     // }
-
                     total_size += tensor.nbytes();
                     // whisper_mode.n_loaded += 1;
                     match r.fill_buf() {
@@ -821,34 +824,38 @@ fn llama_eval(model: &LlamaModel, embd_inp: &[GptVocabId], mem_per_token: usize)
         embd.dim().stride_4d()
     );
 
-    let inp = get_rows(&mut tensor_ctx, &model.tok_embeddings, &embd)?;
+    let inp_l = get_rows(&mut tensor_ctx, &model.tok_embeddings, &embd)?;
 
-    // let x: &[BlockQ4_0] = unsafe { model.tok_embeddings.as_slice::<BlockQ4_0>() };
+    let x: &[f32] = unsafe { inp_l.as_slice::<f32>() };
     let mut sum: f64 = 0.0;
-    // for i in 0..model.tok_embeddings.elem_count() {
-    //     if x[i].d().is_nan() {
-    //         sum += x[i].d().abs() as f64;
-    //     }
-    // }
-    println!(
-        "tok_embeddings,sum:{:?},shape:{:?},stride:{:?}",
-        sum,
-        model.tok_embeddings.ggml_shape(),
-        model.tok_embeddings.dim().stride_4d()
-    );
-
-    let x: &[f32] = unsafe { inp.as_slice::<f32>() };
-    let mut sum: f64 = 0.0;
-    for i in 0..inp.elem_count() {
+    for i in 0..inp_l.elem_count() {
         sum += x[i].abs() as f64;
     }
     println!(
-        "k1,sum:{:?},sha
+        "get_rows,sum:{:?},sha
         pe:{:?},stride:{:?}",
         sum,
-        inp.ggml_shape(),
-        inp.dim().stride_4d()
+        inp_l.ggml_shape(),
+        inp_l.dim().stride_4d()
     );
+
+    for il in 0..n_layer {
+        let cur = rms_norm(&mut tensor_ctx, &inp_l)?;
+        let x: &[f32] = unsafe { cur.as_slice::<f32>() };
+        let mut sum: f64 = 0.0;
+        for i in 0..cur.elem_count() {
+            sum += x[i].abs() as f64;
+        }
+        println!(
+            "rms_norm,sum:{:?},sha
+            pe:{:?},stride:{:?}",
+            sum,
+            cur.ggml_shape(),
+            cur.dim().stride_4d()
+        );
+        return Ok(());
+    }
+
     Ok(())
 }
 
@@ -856,7 +863,7 @@ fn compute_ctx_size(hparams: &LlamaHparams) -> usize {
     let wtype = match hparams.f16 {
         0 => DType::F32,
         1 => DType::F16,
-        2 => DType::Q4_0,
+        2 => DType::Q4V1_0,
         _ => {
             todo!()
         }
@@ -905,6 +912,18 @@ fn compute_ctx_size(hparams: &LlamaHparams) -> usize {
         );
     }
     return ctx_size as usize;
+}
+
+enum GGUFVersion {
+    V1,
+    V2,
+    V3,
+}
+
+struct LLamaGGUF {
+    magic: u32,
+    version: GGUFVersion,
+    tensor_count: usize,
 }
 
 fn main() -> LLMResult<()> {
