@@ -3,12 +3,14 @@ use byteorder::ReadBytesExt;
 use galois::error::GError;
 use memmap2::Mmap;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Error as IOError;
 use std::io::Read;
 use thiserror::Error;
 type Endian = LittleEndian;
+use galois::shape::MAX_DIM;
 use galois::DType;
 use galois::Shape;
 use galois::Tensor;
@@ -16,6 +18,8 @@ use galois::GS_BLCK_SIZE;
 use galois::GS_TYPE_SIZE;
 use lazy_static::lazy_static;
 use std::fs::File;
+use std::fs::OpenOptions;
+use std::ptr::NonNull;
 
 fn get_blck_size(t: DType) -> usize {
     return GS_BLCK_SIZE[t as usize];
@@ -56,12 +60,20 @@ const GGML_MAGIC: u32 = 0x67676d6c; // "GGML"
 
 #[derive(Error, Debug)]
 pub enum LLMError {
+    #[error("UnexpectedEof")]
+    UnexpectedEof,
     #[error("Unexpected: {0}")]
     Unexpected(String),
     #[error("Unexpected IO: {0}")]
     UnexpectIO(IOError),
     #[error("invalid model file '{0}' (bad magic)\n")]
     BadMagic(String),
+    #[error("unknown version '{0}' \n")]
+    UnknownVersion(u32),
+    #[error("unknown meta type '{0}' \n")]
+    UnknownMetaType(u32),
+    #[error("unknown array meta type '{0:?}' \n")]
+    UnknownArrayMetaType(GGufMetadataValueType),
     #[error("not enough space in the context's memory pool\n")]
     NotEnoughSpace,
     #[error("unknown tensor '{0}' in model file\n")]
@@ -121,6 +133,327 @@ enum EModel {
     MODEL_40B,
     MODEL_65B,
     MODEL_70B,
+}
+
+trait BinarySerialize: Sized {
+    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self>;
+}
+
+#[derive(Debug)]
+enum GGufVersion {
+    V1,
+    V2,
+    V3,
+}
+
+impl GGufVersion {
+    fn decode(version: u32) -> LLMResult<GGufVersion> {
+        match version {
+            1 => Ok(GGufVersion::V1),
+            2 => Ok(GGufVersion::V2),
+            3 => Ok(GGufVersion::V3),
+            _ => Err(LLMError::UnknownVersion(version)),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct GGufStr {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+impl BinarySerialize for GGufStr {
+    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
+        let len = usize::deserialize(r)?;
+        let buf = r.read_bytes(len)?;
+        Ok(GGufStr {
+            ptr: unsafe { NonNull::new_unchecked(buf.as_ptr() as *mut u8) },
+            len: len,
+        })
+    }
+}
+
+impl GGufStr {
+    fn as_str(&self) -> &str {
+        let slice = unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) };
+        std::str::from_utf8(slice).unwrap()
+    }
+}
+
+impl Drop for GGufStr {
+    fn drop(&mut self) {
+        // do nothing
+    }
+}
+
+impl Debug for GGufStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{:?}", self.as_str()))
+    }
+}
+
+#[derive(Clone)]
+struct GGufSliceData<P> {
+    ptr: NonNull<P>,
+    len: usize,
+}
+
+impl<P> GGufSliceData<P> {
+    fn as_slice(&self) -> &[P] {
+        let slice = unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) };
+        slice
+    }
+}
+
+impl<P> Drop for GGufSliceData<P> {
+    fn drop(&mut self) {
+        // do nothing
+    }
+}
+
+impl<P: Debug> Debug for GGufSliceData<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("slice len:{:?}", self.len))
+    }
+}
+
+impl<P: BinarySerialize> BinarySerialize for GGufSliceData<P> {
+    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
+        let len = usize::deserialize(r)?;
+        let mem_size = len * std::mem::size_of::<P>();
+        let buf = r.read_bytes(mem_size)?;
+        Ok(GGufSliceData {
+            ptr: unsafe { NonNull::new_unchecked(buf.as_ptr() as *mut P) },
+            len: len,
+        })
+    }
+}
+
+impl<P: BinarySerialize> BinarySerialize for Vec<P> {
+    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
+        let len = usize::deserialize(r)?;
+        let mut v: Vec<P> = Vec::with_capacity(len);
+        for _ in 0..len {
+            v.push(P::deserialize(r)?);
+        }
+        Ok(v)
+    }
+}
+
+#[derive(Debug, Clone)]
+enum GGufArr {
+    U8Array(GGufSliceData<u8>),
+    I8Array(GGufSliceData<i8>),
+    U16Array(GGufSliceData<u16>),
+    I16Array(GGufSliceData<i16>),
+    U32Array(GGufSliceData<u32>),
+    I32Array(GGufSliceData<i32>),
+    U64Array(GGufSliceData<u64>),
+    I64Array(GGufSliceData<i64>),
+    F32Array(GGufSliceData<f32>),
+    F64Array(GGufSliceData<f64>),
+    BoolArray(GGufSliceData<u8>),
+    StringArray(Vec<GGufStr>),
+    NestedArray(GGufSliceData<GGufArr>),
+}
+
+impl BinarySerialize for GGufArr {
+    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
+        let typ: GGufMetadataValueType = GGufMetadataValueType::deserialize(r)?;
+        let v = match typ {
+            GGufMetadataValueType::U8 => GGufArr::U8Array(GGufSliceData::<u8>::deserialize(r)?),
+            GGufMetadataValueType::I8 => GGufArr::I8Array(GGufSliceData::<i8>::deserialize(r)?),
+            GGufMetadataValueType::U16 => GGufArr::U16Array(GGufSliceData::<u16>::deserialize(r)?),
+            GGufMetadataValueType::I16 => GGufArr::I16Array(GGufSliceData::<i16>::deserialize(r)?),
+            GGufMetadataValueType::U32 => GGufArr::U32Array(GGufSliceData::<u32>::deserialize(r)?),
+            GGufMetadataValueType::I32 => GGufArr::I32Array(GGufSliceData::<i32>::deserialize(r)?),
+            GGufMetadataValueType::F32 => GGufArr::F32Array(GGufSliceData::<f32>::deserialize(r)?),
+            GGufMetadataValueType::F64 => GGufArr::F64Array(GGufSliceData::<f64>::deserialize(r)?),
+            GGufMetadataValueType::U64 => GGufArr::U64Array(GGufSliceData::<u64>::deserialize(r)?),
+            GGufMetadataValueType::I64 => GGufArr::I64Array(GGufSliceData::<i64>::deserialize(r)?),
+            GGufMetadataValueType::Bool => GGufArr::BoolArray(GGufSliceData::<u8>::deserialize(r)?),
+            GGufMetadataValueType::String => GGufArr::StringArray(Vec::<GGufStr>::deserialize(r)?),
+            _ => return Err(LLMError::UnknownArrayMetaType(typ)),
+        };
+        Ok(v)
+    }
+}
+
+enum GGufTypeValue {
+    U8(u8),
+    I8(i8),
+    U16(u16),
+    I16(i16),
+    U32(u32),
+    I32(i32),
+    U64(u64),
+    I64(i64),
+    F32(f32),
+    F64(f64),
+    Bool(u8),
+    String(GGufStr), //String(&'a str),
+}
+
+struct GGufKV {}
+
+#[derive(Debug, Clone)]
+enum GGufMetadataValue {
+    U8(u8),
+    I8(i8),
+    U16(u16),
+    I16(i16),
+    U32(u32),
+    I32(i32),
+    U64(u64),
+    I64(i64),
+    F32(f32),
+    F64(f64),
+    Bool(u8),
+    String(GGufStr),
+    Array(GGufArr),
+}
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GGufMetadataValueType {
+    U8 = 0,
+    I8 = 1,
+    U16 = 2,
+    I16 = 3,
+    U32 = 4,
+    I32 = 5,
+    F32 = 6,
+    Bool = 7,
+    String = 8,
+    Array = 9,
+    U64 = 10,
+    I64 = 11,
+    F64 = 12,
+}
+
+impl BinarySerialize for GGufMetadataValueType {
+    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
+        let t = u32::deserialize(r)?;
+        let v = match t {
+            0 => GGufMetadataValueType::U8,
+            1 => GGufMetadataValueType::I8,
+            2 => GGufMetadataValueType::U16,
+            3 => GGufMetadataValueType::I16,
+            4 => GGufMetadataValueType::U32,
+            5 => GGufMetadataValueType::I32,
+            6 => GGufMetadataValueType::F32,
+            7 => GGufMetadataValueType::Bool,
+            8 => GGufMetadataValueType::String,
+            9 => GGufMetadataValueType::Array,
+            10 => GGufMetadataValueType::U64,
+            11 => GGufMetadataValueType::I64,
+            12 => GGufMetadataValueType::F64,
+            _ => return Err(LLMError::UnknownMetaType(t)),
+        };
+        Ok(v)
+    }
+}
+
+impl BinarySerialize for u8 {
+    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
+        let u = r.read_u8()?;
+        Ok(u)
+    }
+}
+
+impl BinarySerialize for i8 {
+    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
+        let u = r.read_i8()?;
+        Ok(u)
+    }
+}
+
+impl BinarySerialize for u16 {
+    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
+        let u = r.read_u16::<Endian>()?;
+        Ok(u)
+    }
+}
+
+impl BinarySerialize for i16 {
+    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
+        let u = r.read_i16::<Endian>()?;
+        Ok(u)
+    }
+}
+
+impl BinarySerialize for i32 {
+    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
+        let u = r.read_i32::<Endian>()?;
+        Ok(u)
+    }
+}
+
+impl BinarySerialize for u32 {
+    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
+        let u = r.read_u32::<Endian>()?;
+        Ok(u)
+    }
+}
+
+impl BinarySerialize for f32 {
+    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
+        let u = r.read_f32::<Endian>()?;
+        Ok(u)
+    }
+}
+
+impl BinarySerialize for f64 {
+    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
+        let u = r.read_f64::<Endian>()?;
+        Ok(u)
+    }
+}
+
+impl BinarySerialize for u64 {
+    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
+        let u = r.read_u64::<Endian>()?;
+        Ok(u)
+    }
+}
+
+impl BinarySerialize for i64 {
+    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
+        let u = r.read_i64::<Endian>()?;
+        Ok(u)
+    }
+}
+
+impl BinarySerialize for usize {
+    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
+        let u = r.read_len()?;
+        Ok(u)
+    }
+}
+
+impl BinarySerialize for GGufMetadataValue {
+    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
+        let t = GGufMetadataValueType::deserialize(r)?;
+        let v = match t {
+            GGufMetadataValueType::U8 => GGufMetadataValue::U8(u8::deserialize(r)?),
+            GGufMetadataValueType::I8 => GGufMetadataValue::I8(i8::deserialize(r)?),
+            GGufMetadataValueType::U16 => GGufMetadataValue::U16(u16::deserialize(r)?),
+            GGufMetadataValueType::I16 => GGufMetadataValue::I16(i16::deserialize(r)?),
+            GGufMetadataValueType::U32 => GGufMetadataValue::U32(u32::deserialize(r)?),
+            GGufMetadataValueType::I32 => GGufMetadataValue::I32(i32::deserialize(r)?),
+            GGufMetadataValueType::F32 => GGufMetadataValue::F32(f32::deserialize(r)?),
+            GGufMetadataValueType::F64 => GGufMetadataValue::F64(f64::deserialize(r)?),
+            GGufMetadataValueType::U64 => GGufMetadataValue::U64(u64::deserialize(r)?),
+            GGufMetadataValueType::I64 => GGufMetadataValue::I64(i64::deserialize(r)?),
+            GGufMetadataValueType::String => GGufMetadataValue::String(GGufStr::deserialize(r)?),
+            GGufMetadataValueType::Bool => GGufMetadataValue::Bool(u8::deserialize(r)?),
+            GGufMetadataValueType::Array => GGufMetadataValue::Array(GGufArr::deserialize(r)?),
+            // _=>return Err(LLMError::UnknownVersion(()))
+            //
+        };
+        Ok(v)
+    }
 }
 
 struct TensorContext<'a> {
@@ -410,7 +743,115 @@ impl LlamaHparams {
     }
 }
 
+pub trait GGufRead {
+    fn read_bytes(&mut self, n: usize) -> LLMResult<&[u8]>;
+    //fn read_string(&mut self) -> LLMResult<GGufStr>;
+    fn read_len(&mut self) -> LLMResult<usize>;
+}
+
+struct MmapReader {
+    mmap: Mmap,
+    offset: usize,
+    file_size: usize,
+}
+
+impl MmapReader {
+    fn new(mmap: Mmap, file_size: usize) -> MmapReader {
+        Self {
+            mmap: mmap,
+            offset: 0,
+            file_size: file_size,
+        }
+    }
+
+    fn read_bytes(&mut self, n: usize) -> LLMResult<&[u8]> {
+        if self.offset + n > self.file_size {
+            return Err(LLMError::UnexpectedEof);
+        }
+        let v = &self.mmap[self.offset..self.offset + n];
+        self.offset += n;
+        Ok(v)
+    }
+}
+
+impl Read for MmapReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let buf_len = buf.len();
+        if self.offset + buf_len > self.file_size {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        buf.copy_from_slice(&self.mmap[self.offset..self.offset + buf_len]);
+        self.offset += buf_len;
+        Ok(buf_len)
+    }
+}
+
+struct GGufMmapReader {
+    r: MmapReader,
+    header: GGufHeader,
+}
+
+impl GGufMmapReader {
+    fn new(r: MmapReader, header: GGufHeader) -> GGufMmapReader {
+        GGufMmapReader { r, header }
+    }
+
+    fn version(&self) -> &GGufVersion {
+        &self.header.version
+    }
+
+    fn magic(&self) -> u32 {
+        self.header.magic
+    }
+
+    fn n_tensors(&self) -> usize {
+        self.header.n_tensors as usize
+    }
+
+    fn n_kv(&self) -> usize {
+        self.header.n_kv as usize
+    }
+
+    fn mmap_reader(&mut self) -> &mut MmapReader {
+        &mut self.r
+    }
+}
+
+impl GGufRead for GGufMmapReader {
+    fn read_bytes(&mut self, n: usize) -> LLMResult<&[u8]> {
+        self.r.read_bytes(n)
+    }
+
+    // fn read_string(&mut self) -> LLMResult<GGufStr> {
+    //     let len = self.read_len()?;
+    //     let buf = self.read_bytes(len)?;
+    //     Ok(GGufStr {
+    //         ptr: unsafe { NonNull::new_unchecked(buf.as_ptr() as *mut u8) },
+    //         len: len,
+    //     })
+    // }
+
+    fn read_len(&mut self) -> LLMResult<usize> {
+        let v = match self.version() {
+            GGufVersion::V1 => self.r.read_u32::<Endian>()? as usize,
+            GGufVersion::V2 => self.r.read_u64::<Endian>()? as usize,
+            GGufVersion::V3 => self.r.read_u64::<Endian>()? as usize,
+        };
+        Ok(v)
+    }
+}
+
+impl Read for GGufMmapReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.r.read(buf)
+    }
+}
+
 impl LlamaModel {
+    fn load2<T: Read + GGufRead>(r: &mut T) -> LLMResult<LlamaModel> {
+        todo!()
+    }
+
     fn load<T: Read + BufRead>(
         r: &mut T,
         hparams: LlamaHparams,
@@ -914,19 +1355,71 @@ fn compute_ctx_size(hparams: &LlamaHparams) -> usize {
     return ctx_size as usize;
 }
 
-enum GGUFVersion {
-    V1,
-    V2,
-    V3,
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GGmlType {
+    F32 = 0,
+    F16 = 1,
+    Q4_0 = 2,
+    Q4_1 = 3,
+    // GGML_TYPE_Q4_2 = 4, support has been removed
+    // GGML_TYPE_Q4_3 (5) support has been removed
+    Q5_0 = 6,
+    Q5_1 = 7,
+    Q8_0 = 8,
+    Q8_1 = 9,
+    // k-quantizations
+    Q2K = 10,
+    Q3K = 11,
+    Q4K = 12,
+    Q5K = 13,
+    Q6K = 14,
+    Q8K = 15,
+    I8 = 16,
+    I16 = 17,
+    I32 = 18,
+    COUNT = 19,
 }
 
-struct LLamaGGUF {
+struct GGufHeader {
     magic: u32,
-    version: GGUFVersion,
-    tensor_count: usize,
+    version: GGufVersion,
+    n_tensors: u64,
+    n_kv: u64,
 }
 
-fn main() -> LLMResult<()> {
+struct GGUFOnDiskTensorInfo {
+    name: String,
+    n_dims: u32,
+    dimensions: [usize; MAX_DIM],
+    typ: GGmlType,
+    offset: u64,
+}
+
+impl GGufHeader {
+    fn load<T: Read>(r: &mut T) -> LLMResult<GGufHeader> {
+        let magic = r.read_u32::<Endian>()?;
+        let version = GGufVersion::decode(r.read_u32::<Endian>()?)?;
+        let n_tensors = r.read_u64::<Endian>()?;
+        let n_kv = r.read_u64::<Endian>()?;
+        println!(
+            "magic:{:x}, version:{:?},n_tensors:{},n_kv:{}",
+            magic, version, n_tensors, n_kv,
+        );
+        Ok(GGufHeader {
+            magic: magic,
+            version: version,
+            n_tensors: n_tensors,
+            n_kv: n_kv,
+        })
+    }
+}
+
+struct LLamaGGufModel {
+    gguf_header: GGufHeader,
+}
+
+fn ggml_read() -> LLMResult<()> {
     let model_path = "E:\\cproject\\models\\ggml-model-Q4.bin";
     let mut fin = open_file_stream(model_path)?;
     let magic = fin.read_u32::<Endian>()?;
@@ -954,5 +1447,50 @@ fn main() -> LLMResult<()> {
     llama_eval(&model, &[0, 1, 2, 3], 0)?;
     drop(buf_model);
     drop(model);
+    Ok(())
+}
+
+fn gguf_read() -> LLMResult<()> {
+    let model_path = "E:\\cproject\\llama.cpp-gguf-fix-publish\\models\\llama-2-7b.Q4_0.gguf";
+    let file = OpenOptions::new().read(true).open(model_path)?;
+    let file_size = file.metadata()?.len();
+    let mmap: Mmap = unsafe {
+        memmap2::MmapOptions::new()
+            .map(&file)
+            .map_err(|e| format!("mmap failed: {}", e))?
+    };
+    let mut mmap_reader = MmapReader::new(mmap, file_size as usize);
+    let header = GGufHeader::load(&mut mmap_reader)?;
+    let mut gguf_reader = GGufMmapReader::new(mmap_reader, header);
+
+    let n_kv = gguf_reader.n_kv();
+
+    for i in 0..n_kv {
+        let key = GGufStr::deserialize(&mut gguf_reader)?;
+        let value = GGufMetadataValue::deserialize(&mut gguf_reader)?;
+        println!("str:{}", key.as_str());
+        println!("value:{:?}", value);
+    }
+    let n_tensors = gguf_reader.n_tensors();
+
+    // for i in 0..n_tensors {
+    //     let name = gguf_reader.read_string()?;
+    //     println!("str:{}", name.as_str());
+    //     let n_dims = gguf_reader.mmap_reader().read_u32::<Endian>()?;
+    //     let mut dims = [1usize; 4];
+    //     assert!(n_dims <= 4);
+    //     for j in 0..n_dims as usize {
+    //         dims[j] = gguf_reader.mmap_reader().read_u64::<Endian>()? as usize;
+    //     }
+    //     let ggml_type = gguf_reader.mmap_reader().read_u32::<Endian>()?;
+    //     let offset = gguf_reader.mmap_reader().read_u64::<Endian>()?;
+    //     println!("str:{},n_dims:{},dims:{:?}", name.as_str(), n_dims, dims);
+    //     break;
+    // }
+    Ok(())
+}
+
+fn main() -> LLMResult<()> {
+    gguf_read()?;
     Ok(())
 }
