@@ -839,11 +839,24 @@ impl LlamaHparams {
             .unwrap()
             .get_u32()
             .unwrap();
+        let n_head = r
+            .metas
+            .get(format!("{}.attention.head_count_kv", model_name).as_str())
+            .unwrap()
+            .get_u32()
+            .unwrap();
+        let n_head = r
+            .metas
+            .get(format!("{}.attention.head_count_kv", model_name).as_str())
+            .unwrap()
+            .get_u32()
+            .unwrap();
         println!("arch:{}", model_name);
         println!("n_vocab:{}", n_vocab);
         println!("n_ctx_train:{}", n_ctx_train);
         println!("n_embd:{}", n_embd);
         println!("n_ff:{}", n_ff);
+        println!("n_ff:{}", n_head);
         todo!()
     }
     // fn load<T: Read + BufRead>(r: &mut T) -> LLMResult<LlamaHparams> {
