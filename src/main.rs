@@ -23,6 +23,30 @@ use std::fs::OpenOptions;
 use std::hash::Hash;
 use std::ptr::NonNull;
 
+const LLM_KV_GENERAL_ARCHITECTURE: &'static str = "general.architecture";
+const LLM_KV_TOKENIZER_LIST: &'static str = "tokenizer.ggml.tokens";
+const LLM_KV_CONTEXT_LENGTH: &'static str = ".context_length";
+const LLM_KV_EMBEDDING_LENGTH: &'static str = ".embedding_length";
+const LLM_KV_FEED_FORWARD_LENGTH: &'static str = ".feed_forward_length";
+const LLM_KV_ATTENTION_HEAD_COUNT: &'static str = ".attention.head_count";
+const LLM_KV_BLOCK_COUNT: &'static str = ".block_count";
+const LLM_KV_ATTENTION_HEAD_COUNT_KV: &'static str = ".attention.head_count_kv";
+const LLM_KV_ROPE_FREQ_BASE: &'static str = ".rope.freq_base";
+const LLM_KV_ROPE_SCALE_LINEAR: &'static str = ".rope.scale_linear";
+const LLM_KV_ROPE_DIMENSION_COUNT: &'static str = ".rope.dimension_count";
+
+const LLM_KV_TOKENIZER_MODEL: &'static str = "tokenizer.ggml.model";
+const LLM_KV_TOKENIZER_TOKEN_TYPE: &'static str = "tokenizer.ggml.token_type";
+const LLM_KV_TOKENIZER_SCORES: &'static str = "tokenizer.ggml.scores";
+const LLM_KV_TOKENIZER_MERGES: &'static str = "tokenizer.ggml.merges";
+const LLM_KV_TOKENIZER_BOS_ID: &'static str = "tokenizer.ggml.bos_token_id";
+const LLM_KV_TOKENIZER_EOS_ID: &'static str = "tokenizer.ggml.eos_token_id";
+const LLM_KV_TOKENIZER_UNK_ID: &'static str = "tokenizer.ggml.unknown_token_id";
+const LLM_KV_TOKENIZER_SEP_ID: &'static str = "tokenizer.ggml.seperator_token_id";
+const LLM_KV_TOKENIZER_PAD_ID: &'static str = "tokenizer.ggml.padding_token_id";
+const LLM_KV_TOKENIZER_HF_JSON: &'static str = "tokenizer.huggingface.json";
+const LLM_KV_TOKENIZER_RWKV: &'static str = "tokenizer.rwkv.world";
+
 fn get_blck_size(t: GGmlType) -> usize {
     return GS_BLCK_SIZE[t as usize];
 }
@@ -72,6 +96,8 @@ pub enum LLMError {
     BadMagic(u32),
     #[error("unknown version '{0}' \n")]
     UnknownVersion(u32),
+    #[error("unknown model architecture '{0}' \n")]
+    UnknownModelArchitecture(String),
     #[error("unknown meta type '{0}' \n")]
     UnknownMetaType(u32),
     #[error("unknown array meta type '{0:?}' \n")]
@@ -391,6 +417,26 @@ impl GGufMetadataValue {
             _ => None,
         }
     }
+
+    fn get_str_arr(&self) -> Option<&[GGufStr]> {
+        match self {
+            GGufMetadataValue::Array(e) => match e {
+                GGufArr::StringArray(arr) => Some(arr),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn get_f32_arr(&self) -> Option<&[f32]> {
+        match self {
+            GGufMetadataValue::Array(e) => match e {
+                GGufArr::F32Array(arr) => Some(arr.as_slice()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }
 
 #[repr(u32)]
@@ -553,6 +599,8 @@ impl<'a> TensorContext<'a> {
     }
 }
 
+fn create_tensor() {}
+
 fn new_tensor_1d(ctx: &mut TensorContext, dtype: GGmlType, ne0: usize) -> LLMResult<Tensor> {
     let dim = [ne0];
     new_tensor(ctx, 1, dtype, Shape::from_array(dim))
@@ -597,8 +645,6 @@ fn new_f32_tensor(ctx: &mut TensorContext, value: f32) -> LLMResult<Tensor> {
     Ok(result)
 }
 
-const GGML_MEM_ALIGN: usize = 16;
-
 fn new_tensor(
     ctx: &mut TensorContext,
     n_dims: usize,
@@ -612,7 +658,7 @@ fn new_tensor(
     for i in 1..n_dims {
         size_needed *= ne[i];
     }
-    size_needed = ((size_needed + GGML_MEM_ALIGN - 1) / GGML_MEM_ALIGN) * GGML_MEM_ALIGN;
+    size_needed = ggml_pad(size_needed, GGUF_DEFAULT_ALIGNMENT);
     // println!(
     //     "size_needed:{},get_type_sizef(dtype):{}",
     //     size_needed,
@@ -683,7 +729,7 @@ fn rms_norm(ctx: &mut TensorContext, a: &Tensor) -> LLMResult<Tensor> {
     Ok(dst)
 }
 
-type GptVocabId = i32;
+type GptVocabId = usize;
 type Token = String;
 
 struct GptVocab {
@@ -693,26 +739,96 @@ struct GptVocab {
 }
 
 impl GptVocab {
-    fn load<T: Read + BufRead>(r: &mut T, n_vocab: i32) -> LLMResult<GptVocab> {
-        let mut token_to_id: HashMap<Token, GptVocabId> = HashMap::new();
-        let mut id_to_token: HashMap<GptVocabId, Token> = HashMap::new();
-        for i in 0..n_vocab {
-            let len: u32 = r.read_u32::<Endian>()?;
-            let mut tmp = vec![0; len as usize];
-            r.read_exact(&mut tmp)?;
-            let word = String::from_utf8_lossy(&tmp).to_string();
-            // if i == 1111 {
-            //     println!("{}: vocab[{}] =       = {}\n", function!(), i, word);
-            // }
-            token_to_id.insert(word.clone(), i);
-            id_to_token.insert(i, word);
-        }
+    // fn load<T: Read + BufRead>(r: &mut T, n_vocab: i32) -> LLMResult<GptVocab> {
+    //     let mut token_to_id: HashMap<Token, GptVocabId> = HashMap::new();
+    //     let mut id_to_token: HashMap<GptVocabId, Token> = HashMap::new();
+    //     for i in 0..n_vocab {
+    //         let len: u32 = r.read_u32::<Endian>()?;
+    //         let mut tmp = vec![0; len as usize];
+    //         r.read_exact(&mut tmp)?;
+    //         let word = String::from_utf8_lossy(&tmp).to_string();
+    //         // if i == 1111 {
+    //         //     println!("{}: vocab[{}] =       = {}\n", function!(), i, word);
+    //         // }
+    //         token_to_id.insert(word.clone(), i);
+    //         id_to_token.insert(i, word);
+    //     }
 
-        Ok(GptVocab {
-            n_vocab,
-            token_to_id,
-            id_to_token,
-        })
+    //     Ok(GptVocab {
+    //         n_vocab,
+    //         token_to_id,
+    //         id_to_token,
+    //     })
+    // }
+}
+
+struct LLamaVocab {
+    tokens: Vec<String>,
+    token_to_id: HashMap<Token, GptVocabId>,
+    token_scores: HashMap<GptVocabId, f32>,
+}
+
+impl LLamaVocab {
+    fn load(ctx: &GGufContext) -> LLMResult<LLamaVocab> {
+        let vocab = ctx
+            .metas_data()
+            .get(LLM_KV_TOKENIZER_LIST)
+            .unwrap()
+            .get_str_arr()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect::<Vec<_>>();
+        let eos_token = ctx
+            .metas_data()
+            .get(LLM_KV_TOKENIZER_EOS_ID)
+            .unwrap()
+            .get_u32()
+            .unwrap() as usize;
+        let bos_token = ctx
+            .metas_data()
+            .get(LLM_KV_TOKENIZER_BOS_ID)
+            .unwrap()
+            .get_u32()
+            .unwrap() as usize;
+        let tokenizer_kind = ctx
+            .metas_data()
+            .get(LLM_KV_TOKENIZER_MODEL)
+            .unwrap()
+            .get_str()
+            .unwrap();
+        match tokenizer_kind {
+            "llama" => {
+                let vocab_scores = ctx
+                    .metas_data()
+                    .get(LLM_KV_TOKENIZER_SCORES)
+                    .unwrap()
+                    .get_f32_arr()
+                    .unwrap()
+                    .iter()
+                    .map(|s| *s)
+                    .collect::<Vec<_>>();
+                let token_ids = vocab
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (v.clone(), i))
+                    .collect::<HashMap<_, _>>();
+                let token_scores = vocab_scores
+                    .into_iter()
+                    .enumerate()
+                    .collect::<HashMap<_, _>>();
+                Ok(Self {
+                    tokens: vocab,
+                    token_to_id: token_ids,
+                    token_scores: token_scores,
+                })
+            }
+            _ => {
+                return Err(LLMError::UnknownModelArchitecture(
+                    tokenizer_kind.to_string(),
+                ))
+            }
+        }
     }
 }
 
@@ -772,6 +888,18 @@ pub enum ModelArchitecture {
     Qwen2,
 }
 
+impl ModelArchitecture {
+    fn decode(arch: &str) -> LLMResult<ModelArchitecture> {
+        let v = match arch {
+            "llama" => ModelArchitecture::Llama,
+            "gemma" => ModelArchitecture::Gemma,
+            "qwen2" => ModelArchitecture::Qwen2,
+            _ => return Err(LLMError::UnknownModelArchitecture(arch.to_string())),
+        };
+        Ok(v)
+    }
+}
+
 struct LlamaHparams {
     architecture: ModelArchitecture,
     model_name: String,
@@ -810,54 +938,106 @@ struct LlamaHparams {
 impl LlamaHparams {
     fn load(r: &GGufContext) -> LLMResult<LlamaHparams> {
         let model_name = r
-            .metas
-            .get("general.architecture")
+            .metas_data()
+            .get(LLM_KV_GENERAL_ARCHITECTURE)
             .unwrap()
             .get_str()
             .unwrap();
         let n_vocab = r
-            .metas
-            .get("tokenizer.ggml.tokens")
+            .metas_data()
+            .get(LLM_KV_TOKENIZER_LIST)
             .unwrap()
             .get_arr_n()
             .unwrap();
         let n_ctx_train = r
-            .metas
-            .get(format!("{}.context_length", model_name).as_str())
+            .metas_data()
+            .get(format!("{}{}", model_name, LLM_KV_CONTEXT_LENGTH).as_str())
             .unwrap()
             .get_u32()
             .unwrap();
         let n_embd = r
-            .metas
-            .get(format!("{}.embedding_length", model_name).as_str())
+            .metas_data()
+            .get(format!("{}{}", model_name, LLM_KV_EMBEDDING_LENGTH).as_str())
             .unwrap()
             .get_u32()
             .unwrap();
         let n_ff = r
-            .metas
-            .get(format!("{}.feed_forward_length", model_name).as_str())
+            .metas_data()
+            .get(format!("{}{}", model_name, LLM_KV_FEED_FORWARD_LENGTH).as_str())
             .unwrap()
             .get_u32()
             .unwrap();
         let n_head = r
-            .metas
-            .get(format!("{}.attention.head_count_kv", model_name).as_str())
+            .metas_data()
+            .get(format!("{}{}", model_name, LLM_KV_ATTENTION_HEAD_COUNT).as_str())
             .unwrap()
             .get_u32()
             .unwrap();
-        let n_head = r
-            .metas
-            .get(format!("{}.attention.head_count_kv", model_name).as_str())
+        let n_layer = r
+            .metas_data()
+            .get(format!("{}{}", model_name, LLM_KV_BLOCK_COUNT).as_str())
             .unwrap()
             .get_u32()
             .unwrap();
+        let n_head_kv = r
+            .metas_data()
+            .get(format!("{}{}", model_name, LLM_KV_ATTENTION_HEAD_COUNT_KV).as_str())
+            .unwrap()
+            .get_u32()
+            .unwrap();
+
+        let rope_freq_base_train = r
+            .metas_data()
+            .get(format!("{}{}", model_name, LLM_KV_ROPE_FREQ_BASE).as_str())
+            .unwrap_or_else(|| &GGufMetadataValue::F32(10000.0f32))
+            .get_f32()
+            .unwrap();
+
+        let ropescale = r
+            .metas_data()
+            .get(format!("{}{}", model_name, LLM_KV_ROPE_SCALE_LINEAR).as_str())
+            .unwrap_or(&GGufMetadataValue::F32(1.0f32))
+            .get_f32()
+            .unwrap();
+
+        let rope_freq_scale_train = 1.0f32 / ropescale;
+
+        let n_rot = r
+            .metas_data()
+            .get(format!("{}{}", model_name, LLM_KV_ROPE_DIMENSION_COUNT).as_str())
+            .unwrap_or(&GGufMetadataValue::U32(n_embd / n_head))
+            .get_u32()
+            .unwrap();
+
         println!("arch:{}", model_name);
         println!("n_vocab:{}", n_vocab);
         println!("n_ctx_train:{}", n_ctx_train);
         println!("n_embd:{}", n_embd);
         println!("n_ff:{}", n_ff);
-        println!("n_ff:{}", n_head);
-        todo!()
+        println!("n_head:{}", n_head);
+        println!("n_layer:{}", n_layer);
+        println!("n_head_kv:{}", n_head_kv);
+        println!("rope_freq_base_train:{}", rope_freq_base_train);
+        println!("ropescale:{}", ropescale);
+        println!("n_rot:{}", n_rot);
+
+        Ok(Self {
+            architecture: ModelArchitecture::decode(model_name)?,
+            model_name: model_name.to_string(),
+            vocab_only: false,
+            n_vocab: n_vocab as u32,
+            n_ctx_train: n_ctx_train, // context size the model was trained on
+            n_head: n_head,
+            n_embd: n_embd,
+            n_head_kv: n_head_kv,
+            n_layer: n_layer,
+            n_rot: n_rot,
+            n_ff: n_ff,
+            f_norm_eps: 0.0,
+            f_norm_rms_eps: 0.0,
+            rope_freq_base_train: rope_freq_base_train,
+            rope_freq_scale_train: rope_freq_scale_train,
+        })
     }
     // fn load<T: Read + BufRead>(r: &mut T) -> LLMResult<LlamaHparams> {
     //     let n_vocab: i32 = r.read_i32::<Endian>()?;
@@ -890,8 +1070,12 @@ impl LlamaHparams {
 
 pub trait GGufRead {
     fn read_bytes(&mut self, n: usize) -> LLMResult<&[u8]>;
-    //fn read_string(&mut self) -> LLMResult<GGufStr>;
+
     fn read_len(&mut self) -> LLMResult<usize>;
+    // 返回当前 offset
+    fn offset(&self) -> usize;
+
+    fn cursor(&self) -> &[u8];
 }
 
 struct MmapReader {
@@ -916,6 +1100,14 @@ impl MmapReader {
         let v = &self.mmap[self.offset..self.offset + n];
         self.offset += n;
         Ok(v)
+    }
+
+    fn cursor(&self) -> &[u8] {
+        &self.mmap[self.offset..]
+    }
+
+    fn offset(&self) -> usize {
+        self.offset
     }
 }
 
@@ -955,14 +1147,13 @@ impl GGufRead for GGufMmapReader {
         self.r.read_bytes(n)
     }
 
-    // fn read_string(&mut self) -> LLMResult<GGufStr> {
-    //     let len = self.read_len()?;
-    //     let buf = self.read_bytes(len)?;
-    //     Ok(GGufStr {
-    //         ptr: unsafe { NonNull::new_unchecked(buf.as_ptr() as *mut u8) },
-    //         len: len,
-    //     })
-    // }
+    fn offset(&self) -> usize {
+        self.r.offset()
+    }
+
+    fn cursor(&self) -> &[u8] {
+        self.r.cursor()
+    }
 
     fn read_len(&mut self) -> LLMResult<usize> {
         let v = match self.version() {
@@ -981,7 +1172,16 @@ impl Read for GGufMmapReader {
 }
 
 impl LlamaModel {
-    fn load2<T: Read + GGufRead>(r: &mut T) -> LLMResult<LlamaModel> {
+    fn load<T: Read + GGufRead>(gguf_reader: &mut T) -> LLMResult<LlamaModel> {
+        // let mmap_reader = gguf_reader.mmap_reader();
+        let position = gguf_reader.offset();
+        // let alignment = header.alignment() as usize;
+        let next_position = position - (position % GGUF_DEFAULT_ALIGNMENT) + GGUF_DEFAULT_ALIGNMENT;
+        let _ = gguf_reader.read_bytes(next_position - position)?;
+        let tensor_data = gguf_reader.cursor();
+
+        let mut tensor_ctx = TensorContext::new(tensor_data);
+
         todo!()
     }
 
@@ -1546,7 +1746,11 @@ struct GGufContext {
     tensor_infos: HashMap<GGufStr, GGufDiskTensorInfo>,
 }
 
-impl GGufContext {}
+impl GGufContext {
+    fn metas_data(&self) -> &HashMap<GGufStr, GGufMetadataValue> {
+        &self.metas
+    }
+}
 
 struct GGufHeader {
     magic: u32,
@@ -1566,12 +1770,19 @@ impl GGufKV {
     }
 }
 
+const GGUF_DEFAULT_ALIGNMENT: usize = 32;
+
+fn ggml_pad(x: usize, n: usize) -> usize {
+    (x + n - 1) & !(n - 1)
+}
+
 struct GGufDiskTensorInfo {
     //name: GGufStr,
     n_dims: u32,
     dimensions: [usize; MAX_DIM],
     typ: GGmlType,
     offset: u64,
+    size: usize,
 }
 
 impl GGufDiskTensorInfo {
@@ -1585,12 +1796,13 @@ impl GGufDiskTensorInfo {
         for i in 1..n_dims as usize {
             size_needed *= dimensions[i];
         }
-        size_needed = ((size_needed + GGML_MEM_ALIGN - 1) / GGML_MEM_ALIGN) * GGML_MEM_ALIGN;
+        size_needed = ggml_pad(size_needed, GGUF_DEFAULT_ALIGNMENT);
         Self {
             n_dims,
             dimensions,
             typ,
             offset,
+            size: size_needed,
         }
     }
 }
@@ -1629,9 +1841,9 @@ impl GGufHeader {
     }
 }
 
-struct LLamaGGufModel {
-    gguf_header: GGufHeader,
-}
+// struct LLamaGGufModel {
+//     gguf_header: GGufHeader,
+// }
 
 // fn ggml_read() -> LLMResult<()> {
 //     let model_path = "E:\\cproject\\models\\ggml-model-Q4.bin";
@@ -1708,7 +1920,9 @@ fn gguf_read() -> LLMResult<()> {
         tensor_infos: gg_tensor_infos,
     };
     let h = LlamaHparams::load(&gguf_ctx)?;
+    let vocab = LLamaVocab::load(&gguf_ctx)?;
 
+    LlamaModel::load(&mut gguf_reader)?;
     Ok(())
 }
 
