@@ -2,9 +2,12 @@ use byteorder::LittleEndian;
 use byteorder::ReadBytesExt;
 use galois::error::GError;
 use galois::op::RopeCustomOption;
+use galois::op::UnaryOp;
 use galois::F16;
 use memmap2::Mmap;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::f32::INFINITY;
 use std::fmt::Debug;
 use std::io::BufReader;
 use std::io::Error as IOError;
@@ -698,7 +701,7 @@ fn new_tensor_4d(
     ne3: usize,
     ne4: usize,
 ) -> LLMResult<Tensor> {
-    let dim = [ne0, ne1];
+    let dim = [ne0, ne1, ne3, ne4];
     new_tensor(ctx, 2, dtype, Shape::from_array(dim))
 }
 
@@ -852,10 +855,37 @@ fn permute(
     Ok(dst)
 }
 
-fn cpy(src: &Tensor, cur: &Tensor) -> LLMResult<Tensor> {
-    let mut dst = cur.view();
-    galois::op::galois_cpy(src, &mut dst)?;
+fn cpy(src: &Tensor, dst: &mut Tensor) -> LLMResult<()> {
+    // let mut dst = cur.view();
+    galois::op::galois_cpy(src, dst)?;
+    Ok(())
+}
+
+fn cont_4d(
+    ctx: &mut TensorContext,
+    a: &Tensor,
+    ne0: usize,
+    ne1: usize,
+    ne2: usize,
+    ne3: usize,
+) -> LLMResult<Tensor> {
+    let mut dst = new_tensor_4d(ctx, a.dtype(), ne0, ne1, ne2, ne3)?;
+    galois::op::galois_cont(a, &mut dst)?;
     Ok(dst)
+}
+
+fn cont_2d(ctx: &mut TensorContext, a: &Tensor, ne0: usize, ne1: usize) -> LLMResult<Tensor> {
+    cont_4d(ctx, a, ne0, ne1, 1, 1)
+}
+
+fn unary(ctx: &mut TensorContext, a: &Tensor, op: UnaryOp) -> LLMResult<Tensor> {
+    let mut dst = dup_tensor(ctx, a)?;
+    galois::op::galois_unary(a, &mut dst, op)?;
+    Ok(dst)
+}
+
+fn silu(ctx: &mut TensorContext, a: &Tensor) -> LLMResult<Tensor> {
+    unary(ctx, a, UnaryOp::Silu)
 }
 
 fn reshape_2d(a: &Tensor, ne0: usize, ne1: usize) -> LLMResult<Tensor> {
@@ -907,9 +937,15 @@ fn add(ctx: &mut TensorContext, a: &Tensor, b: &Tensor) -> LLMResult<Tensor> {
     Ok(dst)
 }
 
-fn rms_norm(ctx: &mut TensorContext, a: &Tensor) -> LLMResult<Tensor> {
+fn rms_norm(ctx: &mut TensorContext, a: &Tensor, eps: f32) -> LLMResult<Tensor> {
     let mut dst = dup_tensor(ctx, a)?;
-    galois::op::galois_rms_norm(a, &mut dst)?;
+    galois::op::galois_rms_norm(a, &mut dst, eps)?;
+    Ok(dst)
+}
+
+fn soft_max(ctx: &mut TensorContext, a: &Tensor) -> LLMResult<Tensor> {
+    let mut dst = dup_tensor(ctx, a)?;
+    galois::op::galois_soft_max(a, &mut dst)?;
     Ok(dst)
 }
 
@@ -990,13 +1026,16 @@ fn rope_custom(
     Ok(dst)
 }
 
-type GptVocabId = i32;
+type LlamaToken = i32;
+type LlamaPos = i32;
+type LlamaSeqId = i32;
+
 type Token = String;
 
 struct GptVocab {
     n_vocab: i32,
-    token_to_id: HashMap<Token, GptVocabId>,
-    id_to_token: HashMap<GptVocabId, Token>,
+    token_to_id: HashMap<Token, LlamaToken>,
+    id_to_token: HashMap<LlamaToken, Token>,
 }
 
 impl GptVocab {
@@ -1025,8 +1064,8 @@ impl GptVocab {
 
 struct LLamaVocab {
     tokens: Vec<String>,
-    token_to_id: HashMap<Token, GptVocabId>,
-    token_scores: HashMap<GptVocabId, f32>,
+    token_to_id: HashMap<Token, LlamaToken>,
+    token_scores: HashMap<LlamaToken, f32>,
 }
 
 impl LLamaVocab {
@@ -1112,8 +1151,10 @@ struct LlamaModel {
 
     tok_embeddings: Tensor,
 
-    norm: Tensor,
-    //output: Tensor,
+    output_norm: Tensor,
+
+    output: Tensor,
+
     layers: Vec<LlamaLayer>,
     // key + value memory
     // memory_k: Tensor,
@@ -1293,8 +1334,8 @@ impl LlamaHparams {
             n_layer: n_layer,
             n_rot: n_rot,
             n_ff: n_ff,
-            f_norm_eps: 0.0,
-            f_norm_rms_eps: 0.0,
+            f_norm_eps: 0.0e+00,
+            f_norm_rms_eps: 1.0e-05,
             rope_freq_base_train: rope_freq_base_train,
             rope_freq_scale_train: rope_freq_scale_train,
         })
@@ -1453,6 +1494,13 @@ impl LlamaModel {
             "output_norm.weight",
             [n_embd],
         )?;
+
+        let output = create_tensor(
+            &mut tensor_ctx,
+            &tensor_infos,
+            "output.weight",
+            [n_embd, n_vocab],
+        )?;
         // let output = create_tensor(&mut tensor_ctx, "output.weight", [n_embd, n_vocab])?;
         // let output_norm = create_tensor(&mut tensor_ctx, "output_norm.weight", [n_embd]);
         let mut layers = Vec::new();
@@ -1537,8 +1585,8 @@ impl LlamaModel {
 
             tok_embeddings: tok_embeddings,
 
-            norm: output_norm,
-            //output: Tensor,
+            output_norm: output_norm,
+            output: output,
             layers: layers,
             // key + value memory
             // memory_k: Tensor,
@@ -1869,10 +1917,10 @@ fn open_file_stream(fname: &str) -> LLMResult<BufReader<File>> {
 
 const MAX_TOKEN_LEN: usize = 18;
 
-fn llama_tokenize(vocab: &GptVocab, text: &str, bos: bool) -> Vec<GptVocabId> {
-    let mut res: Vec<GptVocabId> = Vec::new();
+fn llama_tokenize(vocab: &GptVocab, text: &str, bos: bool) -> Vec<LlamaToken> {
+    let mut res: Vec<LlamaToken> = Vec::new();
     let mut score: Vec<usize> = Vec::new();
-    let mut prev: Vec<GptVocabId> = Vec::new();
+    let mut prev: Vec<LlamaToken> = Vec::new();
     let len = text.len();
 
     score.resize(len + 1, 0);
@@ -1923,12 +1971,114 @@ fn llama_tokenize(vocab: &GptVocab, text: &str, bos: bool) -> Vec<GptVocabId> {
     return res;
 }
 
+#[derive(Clone)]
+struct LlamaKvCell {
+    pos: LlamaPos,
+    delta: LlamaPos,
+    seq_id: HashSet<LlamaSeqId>,
+}
+
+impl Default for LlamaKvCell {
+    fn default() -> Self {
+        Self {
+            pos: -1,
+            delta: 0,
+            seq_id: HashSet::new(),
+        }
+    }
+}
+
+impl LlamaKvCell {
+    fn new() -> Self {
+        LlamaKvCell {
+            pos: -1,
+            delta: 0,
+            seq_id: HashSet::new(),
+        }
+    }
+
+    fn has_seq_id(&self, id: &LlamaSeqId) -> bool {
+        self.seq_id.contains(id)
+    }
+}
+
+struct LlamaKvCache {
+    head: usize,
+    size: usize,
+    n: usize,
+    cells: Vec<LlamaKvCell>,
+}
+
+impl LlamaKvCache {
+    fn new(n_ctx: usize) -> LlamaKvCache {
+        Self {
+            head: 0,
+            size: n_ctx,
+            n: 0,
+            cells: vec![LlamaKvCell::default(); n_ctx],
+        }
+    }
+
+    fn llama_kv_cache_find_slot(&mut self, batch: &LlamaBatch) -> bool {
+        let n_ctx = self.size;
+        let n_tokens = batch.n_token();
+
+        if n_tokens > n_ctx {
+            eprintln!("Error: n_tokens={} > n_ctx={}", n_tokens, n_ctx);
+            return false;
+        }
+
+        let mut n_tested = 0;
+
+        loop {
+            if (self.head + n_tokens) > n_ctx {
+                n_tested += n_ctx - self.head;
+                self.head = 0;
+                continue;
+            }
+
+            let mut found = true;
+            for i in 0..n_tokens {
+                if self.cells[self.head + i].pos >= 0 {
+                    found = false;
+                    self.head += i + 1;
+                    n_tested += i + 1;
+                    break;
+                }
+            }
+
+            if found {
+                break;
+            }
+
+            if n_tested >= n_ctx {
+                eprintln!("Error: n_tested={} > n_ctx={}", n_tested, n_ctx);
+                // Optionally log an error here if needed
+                return false;
+            }
+        }
+
+        // Final assignment of positions and seq_id for the batch tokens
+        for i in 0..n_tokens {
+            let index = self.head + i;
+            self.cells[index].pos = batch.pos[i];
+            self.cells[index].seq_id.insert(batch.seq_id[i]);
+        }
+
+        true
+    }
+}
+
 fn llama_eval(
     model: &LlamaModel,
-    embd_inp: &[GptVocabId],
-    pos: &[i32],
+    batch: &LlamaBatch,
+    kv_self: &LlamaKvCache,
+    // embd_inp: &[LlamaToken],
+    // seq_id: &[LlamaSeqId],
+    // pos: &[LlamaPos],
     mem_per_token: usize,
 ) -> LLMResult<()> {
+    let embd_inp = batch.embd_inp();
     let n_tokens = embd_inp.len();
     let hparams = &model.hparams;
 
@@ -1941,6 +2091,7 @@ fn llama_eval(
     let d_key = (n_embd / n_head) as usize;
     let n_embd_head = hparams.n_embd_head() as usize;
     let n_embd_gqa = hparams.n_embd_gqa() as usize;
+    let norm_rms_eps = hparams.f_norm_rms_eps;
     assert!(n_embd_head == hparams.n_rot as usize);
     let freq_base = 10000.0;
     let freq_scale = 1.0;
@@ -1950,7 +2101,7 @@ fn llama_eval(
     let n_ctx = 512usize;
     let n_mem = n_layer * n_ctx;
     let n_elements = (n_embd * n_mem) as usize;
-    let kv_head = 0; // n_ctx - n_tokens;
+    let kv_head = 0; // head;
     let n_kv = 32;
 
     let buf_size = 512 * 1024 * 1024; //30MB
@@ -1968,117 +2119,196 @@ fn llama_eval(
         embd.as_slice_mut::<i32>().copy_from_slice(embd_inp);
     }
 
-    let inp_l = get_rows(&mut tensor_ctx, &model.tok_embeddings, &embd)?;
+    let mut inp_l = get_rows(&mut tensor_ctx, &model.tok_embeddings, &embd)?;
 
     let mut KQ_scale = new_tensor_1d(&mut tensor_ctx, GGmlType::F32, 1)?;
     set_f32(&mut KQ_scale, 1.0f32 / (n_embd_head as f32).sqrt())?;
+
+    let mut KQ_mask = new_tensor_3d(&mut tensor_ctx, GGmlType::F32, n_kv, n_tokens, 1)?;
+
+    unsafe {
+        let data = KQ_mask.as_slice_mut::<f32>();
+        for h in 0..1 {
+            for j in 0..n_tokens {
+                let pos = batch.pos[j];
+                let seq_id = batch.seq_id[j];
+                for i in 0..n_kv {
+                    if !kv_self.cells[i].has_seq_id(&seq_id) || kv_self.cells[i].pos > pos {
+                        data[h * (n_kv * n_tokens) + j * n_kv + i] = -INFINITY;
+                    }
+                }
+            }
+        }
+    }
 
     let mut KQ_pos = new_tensor_1d(&mut tensor_ctx, GGmlType::I32, n_tokens)?;
 
     unsafe {
         let s = KQ_pos.as_slice_mut::<i32>();
         for i in 0..n_tokens {
-            s[i] = pos[i]
+            s[i] = batch.pos[i]
         }
     }
 
-    for il in 0..n_layer as usize {
-        let x = unsafe { model.layers[il].wk.as_slice::<BlockQ4_0>() };
-        let mut sum: i32 = 0;
-        for i in 0..x.len() {
-            sum += x[i].qs().iter().map(|e| *e as i32).sum::<i32>();
-        }
-        println!(
-            "wk,sum:{:?},shape:{:?},stride:{:?},elem_count:{:?}",
-            sum,
-            model.layers[il].wk.ggml_shape(),
-            model.layers[il].wk.dim().stride_4d(),
-            model.layers[il].wk.elem_count(),
-        );
-        let mut cur = rms_norm(&mut tensor_ctx, &inp_l)?;
+    for il in 0..1 as usize {
+        //let x = unsafe { model.layers[il].wk.as_slice::<BlockQ4_0>() };
+        // let mut sum: i32 = 0;
+        // for i in 0..x.len() {
+        //     sum += x[i].qs().iter().map(|e| *e as i32).sum::<i32>();
+        // }
+        // println!(
+        //     "wk,sum:{:?},shape:{:?},stride:{:?},elem_count:{:?}",
+        //     sum,
+        //     model.layers[il].wk.ggml_shape(),
+        //     model.layers[il].wk.dim().stride_4d(),
+        //     model.layers[il].wk.elem_count(),
+        // );
+        let inpSA = &inp_l;
+        let mut cur = rms_norm(&mut tensor_ctx, &inp_l, norm_rms_eps)?;
+
         cur = mul(&mut tensor_ctx, &cur, &model.layers[il].attention_norm)?;
-        let tmpk = matmul(&mut tensor_ctx, &model.layers[il].wk, &cur)?;
-        let tmpq = matmul(&mut tensor_ctx, &model.layers[il].wq, &cur)?;
-
-        let Kcur = rope_custom(
-            &mut tensor_ctx,
-            &reshape_3d(&tmpk, n_embd_head, n_head_kv, n_tokens)?,
-            &KQ_pos,
-            n_embd_head,
-            0,
-            0,
-            freq_base,
-            freq_scale,
-            0.0f32,
-            false,
-        )?;
-
-        let Qcur = rope_custom(
-            &mut tensor_ctx,
-            &reshape_3d(&tmpq, n_embd_head, n_head, n_tokens)?,
-            &KQ_pos,
-            n_embd_head,
-            0,
-            0,
-            freq_base,
-            freq_scale,
-            0.0f32,
-            false,
-        )?;
-
-        // store key and value to memory
         {
-            let tmpv = matmul(&mut tensor_ctx, &model.layers[il].wv, &cur)?;
-            let Vcur = transpose(&mut reshape_2d(&tmpv, n_embd_gqa, n_tokens)?)?;
+            let tmpk = matmul(&mut tensor_ctx, &model.layers[il].wk, &cur)?;
+            let tmpq = matmul(&mut tensor_ctx, &model.layers[il].wq, &cur)?;
 
-            let k = view_1d(
+            let Kcur = rope_custom(
+                &mut tensor_ctx,
+                &reshape_3d(&tmpk, n_embd_head, n_head_kv, n_tokens)?,
+                &KQ_pos,
+                n_embd_head,
+                0,
+                0,
+                freq_base,
+                freq_scale,
+                0.0f32,
+                false,
+            )?;
+
+            let Qcur = rope_custom(
+                &mut tensor_ctx,
+                &reshape_3d(&tmpq, n_embd_head, n_head, n_tokens)?,
+                &KQ_pos,
+                n_embd_head,
+                0,
+                0,
+                freq_base,
+                freq_scale,
+                0.0f32,
+                false,
+            )?;
+
+            // store key and value to memory
+            {
+                let tmpv = matmul(&mut tensor_ctx, &model.layers[il].wv, &cur)?;
+                let Vcur = transpose(&mut reshape_2d(&tmpv, n_embd_gqa, n_tokens)?)?;
+
+                let mut k = view_1d(
+                    &memory_k,
+                    n_tokens * n_embd_gqa,
+                    (memory_k.elem_size() * n_embd_gqa) * (il * n_ctx + kv_head),
+                )?;
+
+                let mut v = view_2d(
+                    &memory_v,
+                    n_tokens,
+                    n_embd_gqa,
+                    n_ctx,
+                    (il * n_ctx) * memory_v.elem_size() * n_embd_gqa
+                        + kv_head * memory_v.elem_size(),
+                )?;
+
+                // important: storing RoPE-ed version of K in the KV cache!
+                cpy(&Kcur, &mut k)?;
+                cpy(&Vcur, &mut v)?;
+            }
+
+            let Q = permute(&Qcur, 0, 2, 1, 3)?;
+
+            let K = view_3d(
                 &memory_k,
-                n_tokens * n_embd_gqa,
-                (memory_k.elem_size() * n_embd_gqa) * (il * n_ctx + kv_head),
-            )?;
-
-            let v = view_2d(
-                &memory_v,
-                n_tokens,
+                n_embd_head,
+                n_kv,
+                n_head_kv,
                 n_embd_gqa,
-                n_ctx,
-                (il * n_ctx) * memory_v.elem_size() * n_embd_gqa + kv_head * memory_v.elem_size(),
+                n_embd_head,
+                memory_k.elem_size() * n_embd_gqa * n_ctx * il,
             )?;
 
-            // important: storing RoPE-ed version of K in the KV cache!
-            cpy(&Kcur, &k)?;
-            cpy(&Vcur, &v)?;
+            let KQ = matmul(&mut tensor_ctx, &K, &Q)?;
+
+            let KQ_scaled = scale(&mut tensor_ctx, &KQ, &KQ_scale)?;
+
+            let KQ_masked = add(&mut tensor_ctx, &KQ_scaled, &KQ_mask)?;
+
+            let KQ_soft_max = soft_max(&mut tensor_ctx, &KQ_masked)?;
+
+            let V = view_3d(
+                &memory_v,
+                n_kv,
+                n_embd_head,
+                n_head_kv,
+                n_ctx,
+                n_ctx * n_embd_head,
+                memory_v.elem_size() * n_ctx * n_embd_gqa * il,
+            )?;
+            let KQV = matmul(&mut tensor_ctx, &V, &KQ_soft_max)?;
+
+            let KQV_merged = permute(&KQV, 0, 2, 1, 3)?;
+
+            cur = cont_2d(&mut tensor_ctx, &KQV_merged, n_embd, n_tokens)?;
+
+            cur = matmul(&mut tensor_ctx, &model.layers[il].wo, &cur)?;
         }
 
-        let Q = permute(&Qcur, 0, 2, 1, 3)?;
+        let inpFF = add(&mut tensor_ctx, &cur, inpSA)?;
+        // feed-forward network
+        {
+            {
+                cur = rms_norm(&mut tensor_ctx, &inpFF, norm_rms_eps)?;
 
-        let K = view_3d(
-            &memory_k,
-            n_embd_head,
-            n_kv,
-            n_head_kv,
-            n_embd_gqa,
-            n_embd_head,
-            n_embd_gqa * n_ctx * il,
-        )?;
+                cur = mul(&mut tensor_ctx, &cur, &model.layers[il].ffn_norm)?;
+            }
 
-        let KQ = matmul(&mut tensor_ctx, &K, &Q)?;
+            let tmp = matmul(&mut tensor_ctx, &model.layers[il].w3, &cur)?;
+            cur = matmul(&mut tensor_ctx, &model.layers[il].w1, &cur)?;
 
-        let KQ_scaled = scale(&mut tensor_ctx, &KQ, &KQ_scale)?;
+            // SILU activation
+            cur = silu(&mut tensor_ctx, &cur)?;
 
-        let x: &[f32] = unsafe { KQ_scaled.as_slice::<f32>() };
-        let mut sum: f32 = 0.0;
-        for i in 0..KQ_scaled.elem_count() {
-            sum += x[i];
+            cur = mul(&mut tensor_ctx, &cur, &tmp)?;
+
+            cur = matmul(&mut tensor_ctx, &model.layers[il].w2, &cur)?;
         }
-        println!(
-            "cur,sum:{:?},shape:{:?},stride:{:?}",
-            sum,
-            KQ_scaled.shape_layout(),
-            KQ_scaled.dim().stride_4d()
-        );
-        return Ok(());
+
+        cur = add(&mut tensor_ctx, &cur, &inpFF)?;
+
+        // input for next layer
+        inp_l = cur;
     }
+
+    let mut cur = inp_l;
+
+    {
+        cur = rms_norm(&mut tensor_ctx, &cur, norm_rms_eps)?;
+
+        cur = mul(&mut tensor_ctx, &cur, &model.output_norm)?;
+    }
+
+    // lm_head
+    cur = matmul(&mut tensor_ctx, &model.output, &cur)?;
+
+    let x: &[f32] = unsafe { cur.as_slice::<f32>() };
+    let mut sum: f32 = 0.0;
+    for i in 0..cur.elem_count() {
+        sum += x[i];
+    }
+    println!(
+        "cur,sum:{:?},shape:{:?},stride:{:?}",
+        sum,
+        cur.shape_layout(),
+        cur.dim().stride_4d()
+    );
+    return Ok(());
 
     Ok(())
 }
@@ -2211,7 +2441,21 @@ impl GGufHeader {
     }
 }
 
-struct LlamaBatch {}
+struct LlamaBatch {
+    token: Vec<LlamaToken>,
+    pos: Vec<LlamaPos>,
+    seq_id: Vec<LlamaSeqId>,
+}
+
+impl LlamaBatch {
+    fn n_token(&self) -> usize {
+        self.token.len()
+    }
+
+    fn embd_inp(&self) -> &[LlamaToken] {
+        &self.token
+    }
+}
 
 fn gguf_read() -> LLMResult<()> {
     let model_path = "/opt/cproject/llama.cpp-gguf-fix-publish/models/llama-2-7b.Q4_0.gguf";
@@ -2263,16 +2507,33 @@ fn gguf_read() -> LLMResult<()> {
     let tokens = vec![1i32, 2];
 
     let n_batch = 0;
+    let n_ctx = 512usize;
     let all_pos_0 = n_batch;
     let all_pos_1 = 1;
+    let all_seq_id = 0;
 
     let mut pos = vec![0i32; tokens.len()];
-
     for i in 0..tokens.len() {
         pos[i] = all_pos_0 + i as i32 * all_pos_1;
     }
 
-    llama_eval(&model, &tokens, &pos, 0).unwrap();
+    let mut seq_id = vec![0i32; tokens.len()];
+    for i in 0..tokens.len() {
+        seq_id[i] = all_seq_id;
+    }
+
+    let batch = LlamaBatch {
+        token: tokens,
+        pos: pos,
+        seq_id: seq_id,
+    };
+
+    let mut kv_cache = LlamaKvCache::new(n_ctx);
+    if !kv_cache.llama_kv_cache_find_slot(&batch) {
+        return Ok(());
+    }
+
+    llama_eval(&model, &batch, &kv_cache, 0).unwrap();
     Ok(())
 }
 
