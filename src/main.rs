@@ -2150,7 +2150,7 @@ fn llama_eval(
         }
     }
 
-    for il in 0..1 as usize {
+    for il in 0..n_layer as usize {
         //let x = unsafe { model.layers[il].wk.as_slice::<BlockQ4_0>() };
         // let mut sum: i32 = 0;
         // for i in 0..x.len() {
