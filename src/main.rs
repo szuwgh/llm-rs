@@ -2167,8 +2167,16 @@ fn llama_eval(
         let mut cur = rms_norm(&mut tensor_ctx, &inp_l, norm_rms_eps)?;
 
         cur = mul(&mut tensor_ctx, &cur, &model.layers[il].attention_norm)?;
+
         {
             let tmpk = matmul(&mut tensor_ctx, &model.layers[il].wk, &cur)?;
+
+            let x: &[f32] = unsafe { tmpk.as_slice::<f32>() };
+            let mut sum: f32 = 0.0;
+            for i in 0..tmpk.elem_count() {
+                sum += x[i];
+            }
+
             let tmpq = matmul(&mut tensor_ctx, &model.layers[il].wq, &cur)?;
 
             let Kcur = rope_custom(
