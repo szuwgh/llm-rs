@@ -2150,7 +2150,7 @@ fn llama_eval(
         }
     }
 
-    for il in 0..n_layer as usize {
+    for il in 0..1 as usize {
         //let x = unsafe { model.layers[il].wk.as_slice::<BlockQ4_0>() };
         // let mut sum: i32 = 0;
         // for i in 0..x.len() {
@@ -2269,12 +2269,26 @@ fn llama_eval(
         }
 
         let inpFF = add(&mut tensor_ctx, &cur, inpSA)?;
+
         // feed-forward network
         {
             {
                 cur = rms_norm(&mut tensor_ctx, &inpFF, norm_rms_eps)?;
 
                 cur = mul(&mut tensor_ctx, &cur, &model.layers[il].ffn_norm)?;
+
+                let x: &[f32] = unsafe { cur.as_slice::<f32>() };
+                let mut sum: f32 = 0.0;
+                for i in 0..cur.elem_count() {
+                    sum += x[i];
+                }
+                println!(
+                    "cur,sum:{:?},shape:{:?},stride:{:?}",
+                    sum,
+                    cur.shape_layout(),
+                    cur.dim().stride_4d()
+                );
+                return Ok(());
             }
 
             let tmp = matmul(&mut tensor_ctx, &model.layers[il].w3, &cur)?;
