@@ -2073,9 +2073,6 @@ fn llama_eval(
     model: &LlamaModel,
     batch: &LlamaBatch,
     kv_self: &LlamaKvCache,
-    // embd_inp: &[LlamaToken],
-    // seq_id: &[LlamaSeqId],
-    // pos: &[LlamaPos],
     mem_per_token: usize,
 ) -> LLMResult<()> {
     let embd_inp = batch.embd_inp();
@@ -2277,18 +2274,18 @@ fn llama_eval(
 
                 cur = mul(&mut tensor_ctx, &cur, &model.layers[il].ffn_norm)?;
 
-                let x: &[f32] = unsafe { cur.as_slice::<f32>() };
-                let mut sum: f32 = 0.0;
-                for i in 0..cur.elem_count() {
-                    sum += x[i];
-                }
-                println!(
-                    "cur,sum:{:?},shape:{:?},stride:{:?}",
-                    sum,
-                    cur.shape_layout(),
-                    cur.dim().stride_4d()
-                );
-                return Ok(());
+                // let x: &[f32] = unsafe { cur.as_slice::<f32>() };
+                // let mut sum: f32 = 0.0;
+                // for i in 0..cur.elem_count() {
+                //     sum += x[i];
+                // }
+                // println!(
+                //     "cur,sum:{:?},shape:{:?},stride:{:?}",
+                //     sum,
+                //     cur.shape_layout(),
+                //     cur.dim().stride_4d()
+                // );
+                // return Ok(());
             }
 
             let tmp = matmul(&mut tensor_ctx, &model.layers[il].w3, &cur)?;
