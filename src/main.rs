@@ -2,6 +2,7 @@ use byteorder::LittleEndian;
 use byteorder::ReadBytesExt;
 use galois::cuda::CudaDevice;
 use galois::error::GError;
+use galois::kernels::init_cuda_function;
 use galois::op::RopeCustomOption;
 use galois::op::UnaryOp;
 use galois::Device;
@@ -770,48 +771,56 @@ fn new_tensor<'a, T: TensorProto>(
     Ok(t)
 }
 
-fn view_tensor<'a>(
-    buf: &[u8],
+fn view_tensor<T: TensorProto>(
+    //buf: &[u8],
+    a: &T,
+    offset: usize,
     n_dims: usize,
     dtype: GGmlType,
     shape: Shape,
-    dev: &Device,
-) -> LLMResult<TensorView<'a>> {
-    Ok(unsafe { TensorView::from_bytes(buf, n_dims, shape, dtype, dev)? })
+    //dev: &Device,
+) -> LLMResult<TensorView<'_>> {
+    // Ok(unsafe { TensorView::from_bytes(buf, n_dims, shape, dtype, dev)? })
+    let v = a.view_tensor(offset, n_dims, dtype, shape);
+    Ok(v)
 }
 
-fn dup_tensor<'a, T: TensorProto>(ctx: &mut TensorContext, buf: &'a [u8], a: &T) -> LLMResult<T> {
+fn dup_tensor<'a, T: TensorProto, R: TensorProto>(
+    ctx: &mut TensorContext,
+    buf: &'a [u8],
+    a: &T,
+) -> LLMResult<R> {
     let dtype = a.dtype();
     let shape = Shape::from_slice(a.dim().shape());
     new_tensor(ctx, buf, a.n_dims(), dtype, shape, a.device())
 }
 
-fn view_1d<'a>(a: &'a TensorView<'a>, ne0: usize, offset: usize) -> LLMResult<TensorView<'a>> {
+fn view_1d<'a, T: TensorProto>(a: &'a T, ne0: usize, offset: usize) -> LLMResult<TensorView<'a>> {
     let dtype = a.dtype();
-    let buf = a.as_bytes();
+    // let buf = a.as_bytes();
     let shape = Shape::from_array([ne0]);
-    view_tensor(&buf[offset..], 1, dtype, shape, a.device())
+    view_tensor(a, offset, 1, dtype, shape)
 }
 
-fn view_2d<'a>(
-    a: &'a TensorView<'a>,
+fn view_2d<'a, T: TensorProto>(
+    a: &'a T,
     ne0: usize,
     ne1: usize,
     nb1: usize,
     offset: usize,
 ) -> LLMResult<TensorView<'a>> {
     let dtype = a.dtype();
-    let buf = a.as_bytes();
+    // let buf = a.as_bytes();
     let shape = Shape::from_array([ne0, ne1]);
-    let mut t = view_tensor(&buf[offset..], 2, dtype, shape, a.device())?;
+    let mut t = view_tensor(a, offset, 2, dtype, shape)?;
     let nb0 = t.dim().stride_1d();
     let nb = [nb0, nb1, nb1 * ne1, nb1 * ne1];
     t.ret_stride(nb);
     Ok(t)
 }
 
-fn view_3d<'a>(
-    a: &'a TensorView<'a>,
+fn view_3d<'a, T: TensorProto>(
+    a: &'a T,
     ne0: usize,
     ne1: usize,
     ne2: usize,
@@ -820,9 +829,9 @@ fn view_3d<'a>(
     offset: usize,
 ) -> LLMResult<TensorView<'a>> {
     let dtype = a.dtype();
-    let buf = a.as_bytes();
+    //let buf = a.as_bytes();
     let shape = Shape::from_array([ne0, ne1, ne2]);
-    let mut t = view_tensor(&buf[offset..], 3, dtype, shape, a.device())?;
+    let mut t = view_tensor(a, offset, 3, dtype, shape)?;
     let nb = t.stride_layout_mut();
     nb[1] = nb1;
     nb[2] = nb2;
@@ -834,13 +843,13 @@ fn transpose<'a>(a: &'a mut TensorView<'a>) -> LLMResult<TensorView<'a>> {
     Ok(a.transpose(0, 1)?)
 }
 
-fn permute<'a>(
-    a: &TensorView<'a>,
+fn permute<'a, T: TensorProto>(
+    a: T,
     axis0: usize,
     axis1: usize,
     axis2: usize,
     axis3: usize,
-) -> LLMResult<TensorView<'a>> {
+) -> LLMResult<T> {
     assert!(axis0 < MAX_DIM);
     assert!(axis1 < MAX_DIM);
     assert!(axis2 < MAX_DIM);
@@ -852,20 +861,21 @@ fn permute<'a>(
     assert!(axis1 != axis2);
     assert!(axis1 != axis3);
     assert!(axis2 != axis3);
+    let mut dst = a;
 
-    let mut dst = view_tensor(
-        a.as_bytes(),
-        a.n_dims(),
-        a.dtype(),
-        Shape::from_slice(a.shape_layout()),
-        a.device(),
-    )?;
+    // let mut dst = view_tensor(
+    //     a,
+    //     0,
+    //     a.n_dims(),
+    //     a.dtype(),
+    //     Shape::from_slice(a.shape_layout()),
+    // )?;
 
     let mut ne = [0usize; MAX_DIM];
     let mut nb = [0usize; MAX_DIM];
 
-    let (ne0, ne1, ne2, ne3) = a.dim4();
-    let (nb0, nb1, nb2, nb3) = a.stride4();
+    let (ne0, ne1, ne2, ne3) = dst.dim4();
+    let (nb0, nb1, nb2, nb3) = dst.stride4();
 
     ne[axis0] = ne0;
     ne[axis1] = ne1;
@@ -896,7 +906,7 @@ fn permute<'a>(
     Ok(dst)
 }
 
-fn cpy<'a>(src: &TensorView<'a>, dst: &mut TensorView<'a>) -> LLMResult<()> {
+fn cpy<'a, X: TensorProto, Y: TensorProto>(src: &X, dst: &mut Y) -> LLMResult<()> {
     // let mut dst = cur.view();
     galois::op::galois_cpy(src, dst)?;
     Ok(())
@@ -945,22 +955,16 @@ fn silu<'a>(
     unary(ctx, buf, a, UnaryOp::Silu)
 }
 
-fn reshape_2d<'a>(a: &'a TensorView<'a>, ne0: usize, ne1: usize) -> LLMResult<TensorView<'a>> {
+fn reshape_2d<'a, T: TensorProto>(a: &'a T, ne0: usize, ne1: usize) -> LLMResult<TensorView<'a>> {
     assert!(a.ggml_is_contiguous());
     assert!(a.elem_count() == ne0 * ne1);
     let ne: [usize; 2] = [ne0, ne1];
-    let result = view_tensor(
-        a.as_bytes(),
-        2,
-        a.dtype(),
-        Shape::from_array(ne),
-        a.device(),
-    )?;
+    let result = view_tensor(a, 0, 2, a.dtype(), Shape::from_array(ne))?;
     Ok(result)
 }
 
-fn reshape_3d<'a>(
-    a: &TensorView<'a>,
+fn reshape_3d<'a, T: TensorProto>(
+    a: &'a T,
     ne0: usize,
     ne1: usize,
     ne2: usize,
@@ -968,13 +972,7 @@ fn reshape_3d<'a>(
     assert!(a.ggml_is_contiguous());
     assert!(a.elem_count() == ne0 * ne1 * ne2);
     let ne: [usize; 3] = [ne0, ne1, ne2];
-    let result = view_tensor(
-        a.as_bytes(),
-        3,
-        a.dtype(),
-        Shape::from_array(ne),
-        a.device(),
-    )?;
+    let result = view_tensor(a, 0, 3, a.dtype(), Shape::from_array(ne))?;
     Ok(result)
 }
 
@@ -1021,13 +1019,8 @@ fn add<'a>(
     Ok(dst)
 }
 
-fn rms_norm<'a, T: TensorProto>(
-    ctx: &mut TensorContext,
-    buf: &'a [u8],
-    a: &T,
-    eps: f32,
-) -> LLMResult<T> {
-    let mut dst = dup_tensor::<T>(ctx, buf, a)?;
+fn rms_norm<T: TensorProto>(ctx: &mut TensorContext, buf: &[u8], a: &T, eps: f32) -> LLMResult<T> {
+    let mut dst = dup_tensor::<T, T>(ctx, buf, a)?;
     galois::op::galois_rms_norm(a, &mut dst, eps)?;
     Ok(dst)
 }
@@ -1060,23 +1053,18 @@ fn repeat<'a>(
     Ok(dst)
 }
 
-fn mul<'a>(
-    ctx: &mut TensorContext,
-    buf: &'a [u8],
-    a: &TensorView<'a>,
-    b: &TensorView<'a>,
-) -> LLMResult<TensorView<'a>> {
+fn mul<T: TensorProto>(ctx: &mut TensorContext, buf: &[u8], a: &T, b: &T) -> LLMResult<T> {
     let mut dst = dup_tensor(ctx, buf, a)?;
     galois::op::galois_mul(a, b, &mut dst)?;
     Ok(dst)
 }
 
-fn matmul<'a>(
+fn matmul<X: TensorProto, Y: TensorProto>(
     ctx: &mut TensorContext,
-    buf: &'a [u8],
-    a: &TensorView<'a>,
-    b: &TensorView<'a>,
-) -> LLMResult<TensorView<'a>> {
+    buf: &[u8],
+    a: &X,
+    b: &Y,
+) -> LLMResult<Y> {
     let ne = [
         a.ggml_shape()[1],
         b.ggml_shape()[1],
@@ -1112,11 +1100,11 @@ fn scale<'a>(
     Ok(dst)
 }
 
-fn rope_custom<'a, T: TensorProto>(
+fn rope_custom<X: TensorProto, Y: TensorProto>(
     ctx: &mut TensorContext,
-    buf: &'a [u8],
-    a: &T,
-    b: &T,
+    buf: &[u8],
+    a: &X,
+    b: &Y,
     n_dims: usize,
     mode: i32,
     n_ctx: i32,
@@ -1124,12 +1112,11 @@ fn rope_custom<'a, T: TensorProto>(
     freq_scale: f32,
     xpos_base: f32,
     xpos_down: bool,
-) -> LLMResult<T> {
+) -> LLMResult<Y> {
     assert!(b.is_vector());
     assert!(b.dtype() == GGmlType::I32);
     assert!(a.dim_2() == b.dim_0());
     let mut dst = dup_tensor(ctx, buf, a)?;
-    println!("dst:shape:{:?}", dst.shape());
 
     let op = RopeCustomOption {
         n_dims: n_dims,
@@ -2312,6 +2299,7 @@ fn llama_eval<'a>(
     kv_self: &LlamaKvCache,
     mem_per_token: usize,
     gpu_dev: &Device,
+    n_gpu_layer: usize,
 ) -> LLMResult<()> {
     let embd_inp = batch.embd_inp();
     let n_tokens = embd_inp.len();
@@ -2360,6 +2348,10 @@ fn llama_eval<'a>(
         n_elements,
         &Device::Cpu,
     )?;
+
+    let cuda_k = memory_k.to_cuda_tensor(gpu_dev)?;
+    let cuda_v = memory_v.to_cuda_tensor(gpu_dev)?;
+
     let mut embd = new_tensor_1d(&mut tensor_ctx, &buf, GGmlType::I32, n_tokens, &Device::Cpu)?;
 
     unsafe {
@@ -2406,35 +2398,126 @@ fn llama_eval<'a>(
         }
     }
 
-    let cuda_inp_l = unsafe {
-        Tensor::from_bytes(
-            inp_l.as_bytes(),
-            inp_l.n_dims(),
-            Shape::from_slice(inp_l.shape()),
-            inp_l.dtype(),
-            gpu_dev,
-        )
-        .unwrap()
-    };
-    for il in 0..1 as usize {
-        let mut cur =
-            rms_norm(&mut tensor_ctx, &buf, &cuda_inp_l, norm_rms_eps)?.to_cpu_tensor()?;
-        let x: &[f32] = unsafe { cur.as_slice::<f32>() };
+    let cuda_KQ_pos = KQ_pos.to_cuda_tensor(gpu_dev)?;
+
+    let cuda_inp_l = inp_l.to_cuda_tensor(gpu_dev)?;
+
+    for il in 0..n_gpu_layer as usize {
+        let mut cur = rms_norm(&mut tensor_ctx, &buf, &cuda_inp_l, norm_rms_eps)?;
+
+        cur = mul(
+            &mut tensor_ctx,
+            &buf,
+            &cur,
+            &model.gpu_layers[il].attention_norm,
+        )?;
+
+        let tmpk = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].wk, &cur)?;
+
+        let tmpk_reshape_3d = reshape_3d(&tmpk, n_embd_head, n_head_kv, n_tokens)?;
+
+        let Kcur = rope_custom(
+            &mut tensor_ctx,
+            &buf,
+            &tmpk_reshape_3d,
+            &cuda_KQ_pos,
+            n_embd_head,
+            0,
+            0,
+            freq_base,
+            freq_scale,
+            0.0f32,
+            false,
+        )?;
+
+        let tmpq = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].wq, &cur)?;
+
+        let tmpq_reshape_3d = reshape_3d(&tmpq, n_embd_head, n_head, n_tokens)?;
+
+        let Qcur = rope_custom(
+            &mut tensor_ctx,
+            &buf,
+            &tmpq_reshape_3d,
+            &cuda_KQ_pos,
+            n_embd_head,
+            0,
+            0,
+            freq_base,
+            freq_scale,
+            0.0f32,
+            false,
+        )?;
+
+        {
+            let tmpv = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].wv, &cur)?;
+
+            let mut tmpv_reshape_2d = reshape_2d(&tmpv, n_embd_gqa, n_tokens)?;
+            let Vcur = transpose(&mut tmpv_reshape_2d)?;
+
+            let mut k = view_1d(
+                &cuda_k,
+                n_tokens * n_embd_gqa,
+                (n_embd_gqa) * (il * n_ctx + kv_head), //memory_k.elem_size()
+            )?;
+
+            let mut v = view_2d(
+                &cuda_v,
+                n_tokens,
+                n_embd_gqa,
+                n_ctx,
+                (il * n_ctx) * n_embd_gqa + kv_head, //memory_v.elem_size()
+            )?;
+
+            // important: storing RoPE-ed version of K in the KV cache!
+            cpy(&Kcur, &mut k)?;
+            cpy(&Vcur, &mut v)?;
+        }
+
+        let Q = permute(Qcur, 0, 2, 1, 3)?;
+
+        let K = view_3d(
+            &cuda_k,
+            n_embd_head,
+            n_kv,
+            n_head_kv,
+            n_embd_gqa,
+            n_embd_head,
+            n_embd_gqa * n_ctx * il, //memory_k.elem_size()
+        )?;
+        println!(
+            "cuda K,shape:{:?} ,stride:{:?}",
+            K.dim().shape_layout(),
+            K.dim().stride_4d()
+        );
+        println!(
+            "cuda Q,shape:{:?} ,stride:{:?}",
+            Q.dim().shape_layout(),
+            Q.dim().stride_4d()
+        );
+
+        let KQ: Tensor = matmul(&mut tensor_ctx, &buf, &K, &Q)?;
+
+        let cpu_v = KQ.to_cpu_tensor()?;
+
+        let x: &[f32] = unsafe { cpu_v.as_slice::<f32>() };
         let mut sum: f32 = 0.0;
-        for i in 0..cur.elem_count() {
+        for i in 0..cpu_v.elem_count() {
             sum += x[i];
         }
         println!(
-            "cuda cur,sum:{:?},shape:{:?},stride:{:?}",
+            "{} cuda cur,sum:{:?},shape:{:?},stride:{:?}",
+            "KQ",
             sum,
-            cur.shape_layout(),
-            cur.dim().stride_4d()
+            cpu_v.shape_layout(),
+            cpu_v.dim().stride_4d()
         );
         return Ok(());
     }
 
+    //let mut Qcur: Option<TensorView<'_>> = None;
+
     for il in 0..1 as usize {
-        let inpSA = &inp_l;
+        //let inpSA = &inp_l;
         let mut cur = rms_norm(&mut tensor_ctx, &buf, &inp_l, norm_rms_eps)?;
 
         cur = mul(
@@ -2461,6 +2544,7 @@ fn llama_eval<'a>(
             0.0f32,
             false,
         )?;
+
         let tmpq = matmul(&mut tensor_ctx, &buf, &model.cpu_layers[il].wq, &cur)?;
 
         let tmpq_reshape_3d = reshape_3d(&tmpq, n_embd_head, n_head, n_tokens)?;
@@ -2478,7 +2562,7 @@ fn llama_eval<'a>(
             0.0f32,
             false,
         )?;
-
+        println!("{} ,stride:{:?}", "Qcur", Qcur.dim().stride_4d());
         // store key and value to memory
         {
             let tmpv = matmul(&mut tensor_ctx, &buf, &model.cpu_layers[il].wv, &cur)?;
@@ -2489,7 +2573,7 @@ fn llama_eval<'a>(
             let mut k = view_1d(
                 &memory_k,
                 n_tokens * n_embd_gqa,
-                (memory_k.elem_size() * n_embd_gqa) * (il * n_ctx + kv_head),
+                (n_embd_gqa) * (il * n_ctx + kv_head), //memory_k.elem_size()
             )?;
 
             let mut v = view_2d(
@@ -2497,16 +2581,15 @@ fn llama_eval<'a>(
                 n_tokens,
                 n_embd_gqa,
                 n_ctx,
-                (il * n_ctx) * memory_v.elem_size() * n_embd_gqa + kv_head * memory_v.elem_size(),
+                (il * n_ctx) * n_embd_gqa + kv_head, //memory_v.elem_size()
             )?;
 
             // important: storing RoPE-ed version of K in the KV cache!
             cpy(&Kcur, &mut k)?;
             cpy(&Vcur, &mut v)?;
         }
-
         {
-            let Q = permute(&Qcur, 0, 2, 1, 3)?;
+            let Q = permute(Qcur, 0, 2, 1, 3)?;
 
             let K = view_3d(
                 &memory_k,
@@ -2515,10 +2598,54 @@ fn llama_eval<'a>(
                 n_head_kv,
                 n_embd_gqa,
                 n_embd_head,
-                memory_k.elem_size() * n_embd_gqa * n_ctx * il,
+                n_embd_gqa * n_ctx * il, //memory_k.elem_size()
             )?;
+            println!(
+                "cpu K,shape:{:?} ,stride:{:?}",
+                K.dim().shape_layout(),
+                K.dim().stride_4d()
+            );
+            println!(
+                "cpu Q,shape:{:?} ,stride:{:?}",
+                Q.dim().shape_layout(),
+                Q.dim().stride_4d()
+            );
 
             let KQ = matmul(&mut tensor_ctx, &buf, &K, &Q)?;
+
+            let x: &[f32] = unsafe { KQ.as_slice::<f32>() };
+            let mut sum: f32 = 0.0;
+            for i in 0..KQ.elem_count() {
+                if i < 10 {
+                    println!("KQ:{:?}", x[i]);
+                }
+                sum += x[i];
+            }
+            println!(
+                "{} cpu cur,sum:{:?},shape:{:?},stride:{:?}",
+                "KQ",
+                sum,
+                KQ.shape_layout(),
+                KQ.dim().stride_4d()
+            );
+            return Ok(());
+
+            let x: &[f32] = unsafe { K.as_slice::<f32>() };
+            let mut sum: f32 = 0.0;
+            for i in 0..Q.elem_count() {
+                if i < 10 {
+                    println!("KQ:{:?}", x[i]);
+                }
+                sum += x[i];
+            }
+            println!(
+                "{} cpu cur,sum:{:?},shape:{:?},stride:{:?}",
+                "K",
+                sum,
+                K.shape_layout(),
+                K.dim().stride_4d()
+            );
+            return Ok(());
 
             let KQ_scaled = scale(&mut tensor_ctx, &buf, &KQ, &KQ_scale)?;
 
@@ -2533,17 +2660,17 @@ fn llama_eval<'a>(
                 n_head_kv,
                 n_ctx,
                 n_ctx * n_embd_head,
-                memory_v.elem_size() * n_ctx * n_embd_gqa * il,
+                n_ctx * n_embd_gqa * il, //memory_v.elem_size()
             )?;
             let KQV = matmul(&mut tensor_ctx, &buf, &V, &KQ_soft_max)?;
 
-            let KQV_merged = permute(&KQV, 0, 2, 1, 3)?;
+            let KQV_merged = permute(KQV, 0, 2, 1, 3)?;
 
             cur = cont_2d(&mut tensor_ctx, &buf, &KQV_merged, n_embd, n_tokens)?;
 
             cur = matmul(&mut tensor_ctx, &buf, &model.cpu_layers[il].wo, &cur)?;
 
-            let inpFF = add(&mut tensor_ctx, &buf, &cur, inpSA)?;
+            let inpFF = add(&mut tensor_ctx, &buf, &cur, &inp_l)?;
 
             // feed-forward network
             {
@@ -2566,9 +2693,8 @@ fn llama_eval<'a>(
 
             cur = add(&mut tensor_ctx, &buf, &cur, &inpFF)?;
         }
-        // input for next layer
-
         inp_l = cur;
+        // input for next layer
     }
 
     let mut cur = inp_l;
@@ -2786,9 +2912,11 @@ fn gguf_read() -> LLMResult<()> {
     };
     let h = LlamaHparams::load(&gguf_ctx)?;
     let vocab = LLamaVocab::load(&gguf_ctx)?;
-
-    let gpu_dev = Device::Gpu(CudaDevice::new(0)?);
-    let model = LlamaModel::load(&mut gguf_reader, h, gg_tensor_infos, &gpu_dev, 1)?;
+    let gpu = CudaDevice::new(0)?;
+    init_cuda_function(&gpu)?;
+    let gpu_dev = Device::Gpu(gpu);
+    let n_gpu_layer = 0;
+    let model = LlamaModel::load(&mut gguf_reader, h, gg_tensor_infos, &gpu_dev, n_gpu_layer)?;
 
     let tokens = vec![1i32, 2];
 
@@ -2819,7 +2947,7 @@ fn gguf_read() -> LLMResult<()> {
         return Ok(());
     }
 
-    llama_eval(&model, &batch, &kv_cache, 0, &gpu_dev).unwrap();
+    llama_eval(&model, &batch, &kv_cache, 0, &gpu_dev, n_gpu_layer).unwrap();
     Ok(())
 }
 
