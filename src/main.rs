@@ -1,24 +1,39 @@
+mod common;
+mod tokenizer;
+mod unicode;
+use crate::common::BinarySerialize;
+use crate::common::GGufRead;
+use crate::common::LLMError;
+use crate::common::LLMResult;
+use crate::meta::GGufContext;
+use crate::meta::GGufHeader;
+use crate::meta::GGufMetadataValue;
+use crate::meta::GGufStr;
+use crate::meta::GGufVersion;
+use crate::meta::LLamaVocab;
+use crate::meta::LlamaBatch;
+use crate::meta::LlamaHparams;
+use crate::meta::LlamaKvCache;
+use crate::tokenizer::replace_all;
+use crate::tokenizer::LLMtokenizerSpm;
 use byteorder::LittleEndian;
 use byteorder::ReadBytesExt;
 use galois::cuda::CudaDevice;
-use galois::error::GError;
 use galois::kernels::init_cuda_function;
 use galois::op::RopeCustomOption;
 use galois::op::UnaryOp;
 use galois::Device;
 use galois::TensorProto;
 use galois::TensorView;
-use galois::F16;
 use memmap2::Mmap;
 use std::collections::HashMap;
-use std::collections::HashSet;
+use tokenizer::tokenize;
+mod meta;
 use std::f32::INFINITY;
-use std::fmt::Debug;
 use std::io::BufReader;
-use std::io::Error as IOError;
+
 use std::io::Read;
 use std::vec;
-use thiserror::Error;
 type Endian = LittleEndian;
 use galois::shape::MAX_DIM;
 use galois::GGmlType;
@@ -27,34 +42,8 @@ use galois::Tensor;
 use galois::GS_BLCK_SIZE;
 use galois::GS_TYPE_SIZE;
 use lazy_static::lazy_static;
-use std::borrow::Borrow;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::hash::Hash;
-use std::ptr::NonNull;
-const LLM_KV_GENERAL_ARCHITECTURE: &'static str = "general.architecture";
-const LLM_KV_TOKENIZER_LIST: &'static str = "tokenizer.ggml.tokens";
-const LLM_KV_CONTEXT_LENGTH: &'static str = ".context_length";
-const LLM_KV_EMBEDDING_LENGTH: &'static str = ".embedding_length";
-const LLM_KV_FEED_FORWARD_LENGTH: &'static str = ".feed_forward_length";
-const LLM_KV_ATTENTION_HEAD_COUNT: &'static str = ".attention.head_count";
-const LLM_KV_BLOCK_COUNT: &'static str = ".block_count";
-const LLM_KV_ATTENTION_HEAD_COUNT_KV: &'static str = ".attention.head_count_kv";
-const LLM_KV_ROPE_FREQ_BASE: &'static str = ".rope.freq_base";
-const LLM_KV_ROPE_SCALE_LINEAR: &'static str = ".rope.scale_linear";
-const LLM_KV_ROPE_DIMENSION_COUNT: &'static str = ".rope.dimension_count";
-
-const LLM_KV_TOKENIZER_MODEL: &'static str = "tokenizer.ggml.model";
-const LLM_KV_TOKENIZER_TOKEN_TYPE: &'static str = "tokenizer.ggml.token_type";
-const LLM_KV_TOKENIZER_SCORES: &'static str = "tokenizer.ggml.scores";
-const LLM_KV_TOKENIZER_MERGES: &'static str = "tokenizer.ggml.merges";
-const LLM_KV_TOKENIZER_BOS_ID: &'static str = "tokenizer.ggml.bos_token_id";
-const LLM_KV_TOKENIZER_EOS_ID: &'static str = "tokenizer.ggml.eos_token_id";
-const LLM_KV_TOKENIZER_UNK_ID: &'static str = "tokenizer.ggml.unknown_token_id";
-const LLM_KV_TOKENIZER_SEP_ID: &'static str = "tokenizer.ggml.seperator_token_id";
-const LLM_KV_TOKENIZER_PAD_ID: &'static str = "tokenizer.ggml.padding_token_id";
-const LLM_KV_TOKENIZER_HF_JSON: &'static str = "tokenizer.huggingface.json";
-const LLM_KV_TOKENIZER_RWKV: &'static str = "tokenizer.rwkv.world";
 
 fn get_blck_size(t: GGmlType) -> usize {
     return GS_BLCK_SIZE[t as usize];
@@ -88,522 +77,6 @@ macro_rules! function {
         let name = type_name_of(f);
         name.strip_suffix("::f").unwrap()
     }};
-}
-
-const GGUF_MAGIC: u32 = 0x46554747; // "GGUF"
-const GGML_MAGIC: u32 = 0x67676d6c; // "GGML"
-
-#[derive(Error, Debug)]
-pub enum LLMError {
-    #[error("UnexpectedEof")]
-    UnexpectedEof,
-    #[error("Unexpected: {0}")]
-    Unexpected(String),
-    #[error("Unexpected IO: {0}")]
-    UnexpectIO(IOError),
-    #[error("invalid model file '{0}' (bad magic)\n")]
-    BadMagic(u32),
-    #[error("unknown version '{0}' \n")]
-    UnknownVersion(u32),
-    #[error("unknown model architecture '{0}' \n")]
-    UnknownModelArchitecture(String),
-    #[error("unknown meta type '{0}' \n")]
-    UnknownMetaType(u32),
-    #[error("unknown array meta type '{0:?}' \n")]
-    UnknownArrayMetaType(GGufMetadataValueType),
-    #[error("unknown ggml type '{0:?}' \n")]
-    UnknownGGmlType(u32),
-    #[error("not enough space in the context's memory pool\n")]
-    NotEnoughSpace,
-    #[error("unknown tensor '{0}' in model file\n")]
-    UnknownTensor(String),
-    #[error("invalid ref tensor '{0}'\n")]
-    BadRefTensor(String),
-    #[error("tensor {0} has wrong size in model file, got:{1}, expected:{2}\n")]
-    WrongSizeTensor(String, usize, usize),
-    #[error("tensor {0} has wrong shape in model file, got:{1:?}, expected:{2:?}\n")]
-    WrongShapeTensor(String, Vec<usize>, Vec<usize>),
-    #[error("tensor {0} has wrong bytes in model file, got:{1:?}, expected:{2:?}\n")]
-    WrongBytesTensor(String, usize, usize),
-    #[error("galois tensor:'{0}'")]
-    WrongGTensor(GError),
-    #[error(" unknown ftype '{0}' in model file")]
-    UnknownFtypeGTensor(i32),
-}
-
-impl From<IOError> for LLMError {
-    fn from(e: IOError) -> Self {
-        LLMError::UnexpectIO(e)
-    }
-}
-
-impl From<&str> for LLMError {
-    fn from(e: &str) -> Self {
-        LLMError::Unexpected(e.to_string())
-    }
-}
-
-impl From<String> for LLMError {
-    fn from(e: String) -> Self {
-        LLMError::Unexpected(e)
-    }
-}
-
-impl From<GError> for LLMError {
-    fn from(e: GError) -> Self {
-        LLMError::WrongGTensor(e)
-    }
-}
-
-pub type LLMResult<T> = Result<T, LLMError>;
-
-#[derive(Hash, Eq, PartialEq, Debug, Default)]
-enum EModel {
-    #[default]
-    MODEL_UNKNOWN,
-    MODEL_1B,
-    MODEL_3B,
-    MODEL_7B,
-    MODEL_8B,
-    MODEL_13B,
-    MODEL_15B,
-    MODEL_30B,
-    MODEL_34B,
-    MODEL_40B,
-    MODEL_65B,
-    MODEL_70B,
-}
-
-trait BinarySerialize: Sized {
-    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self>;
-}
-
-#[derive(Debug, Clone)]
-enum GGufVersion {
-    V1,
-    V2,
-    V3,
-}
-
-impl GGufVersion {
-    fn decode(version: u32) -> LLMResult<GGufVersion> {
-        match version {
-            1 => Ok(GGufVersion::V1),
-            2 => Ok(GGufVersion::V2),
-            3 => Ok(GGufVersion::V3),
-            _ => Err(LLMError::UnknownVersion(version)),
-        }
-    }
-}
-
-#[derive(Clone)]
-struct GGufStr {
-    ptr: NonNull<u8>,
-    len: usize,
-}
-
-impl PartialEq for GGufStr {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.as_str().eq(other.as_str())
-    }
-}
-
-impl Eq for GGufStr {}
-
-impl Hash for GGufStr {
-    #[inline]
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.as_str().hash(state)
-    }
-}
-
-impl BinarySerialize for GGufStr {
-    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
-        let len = usize::deserialize(r)?;
-        let buf = r.read_bytes(len)?;
-        Ok(GGufStr {
-            ptr: unsafe { NonNull::new_unchecked(buf.as_ptr() as *mut u8) },
-            len: len,
-        })
-    }
-}
-
-impl GGufStr {
-    fn as_str(&self) -> &str {
-        let slice = unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) };
-        std::str::from_utf8(slice).unwrap()
-    }
-}
-
-impl Drop for GGufStr {
-    fn drop(&mut self) {
-        // do nothing
-    }
-}
-
-impl Debug for GGufStr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{:?}", self.as_str()))
-    }
-}
-
-impl Borrow<str> for GGufStr {
-    #[inline]
-    fn borrow(&self) -> &str {
-        self.as_str()
-    }
-}
-
-#[derive(Clone)]
-struct GGufSliceData<P> {
-    ptr: NonNull<P>,
-    len: usize,
-}
-
-impl<P> GGufSliceData<P> {
-    fn as_slice(&self) -> &[P] {
-        let slice = unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) };
-        slice
-    }
-
-    fn to_vec(&self) -> Vec<P> {
-        let mut vec = Vec::with_capacity(self.len);
-        let mut current_ptr = self.ptr.as_ptr() as *const u8; // Treat as a byte pointer
-        for _ in 0..self.len {
-            // Copy element by element
-            unsafe {
-                // Read the data at the current pointer
-                let value: P = std::ptr::read_unaligned(current_ptr as *const P);
-                vec.push(value);
-                // Move the pointer to the next element
-                current_ptr = current_ptr.add(std::mem::size_of::<P>());
-            }
-        }
-        vec
-    }
-
-    fn get_len(&self) -> usize {
-        self.len
-    }
-}
-
-impl<P> Drop for GGufSliceData<P> {
-    fn drop(&mut self) {
-        // do nothing
-    }
-}
-
-impl<P: Debug> Debug for GGufSliceData<P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("slice len:{:?}", self.len))
-    }
-}
-
-impl<P: BinarySerialize> BinarySerialize for GGufSliceData<P> {
-    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
-        let len = usize::deserialize(r)?;
-        let mem_size = len * std::mem::size_of::<P>();
-        let buf = r.read_bytes(mem_size)?;
-        Ok(GGufSliceData {
-            ptr: unsafe { NonNull::new_unchecked(buf.as_ptr() as *mut P) },
-            len: len,
-        })
-    }
-}
-
-impl<P: BinarySerialize> BinarySerialize for Vec<P> {
-    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
-        let len = usize::deserialize(r)?;
-        let mut v: Vec<P> = Vec::with_capacity(len);
-        for _ in 0..len {
-            v.push(P::deserialize(r)?);
-        }
-        Ok(v)
-    }
-}
-
-#[derive(Debug, Clone)]
-enum GGufArr {
-    U8Array(GGufSliceData<u8>),
-    I8Array(GGufSliceData<i8>),
-    U16Array(GGufSliceData<u16>),
-    I16Array(GGufSliceData<i16>),
-    U32Array(GGufSliceData<u32>),
-    I32Array(GGufSliceData<i32>),
-    U64Array(GGufSliceData<u64>),
-    I64Array(GGufSliceData<i64>),
-    F32Array(GGufSliceData<f32>),
-    F64Array(GGufSliceData<f64>),
-    BoolArray(GGufSliceData<u8>),
-    StringArray(Vec<GGufStr>),
-    NestedArray(GGufSliceData<GGufArr>),
-}
-
-impl GGufArr {
-    fn get_len(&self) -> usize {
-        match self {
-            GGufArr::U8Array(u) => u.get_len(),
-            GGufArr::I8Array(u) => u.get_len(),
-            GGufArr::U16Array(u) => u.get_len(),
-            GGufArr::I16Array(u) => u.get_len(),
-            GGufArr::U32Array(u) => u.get_len(),
-            GGufArr::I32Array(u) => u.get_len(),
-            GGufArr::U64Array(u) => u.get_len(),
-            GGufArr::I64Array(u) => u.get_len(),
-            GGufArr::F32Array(u) => u.get_len(),
-            GGufArr::F64Array(u) => u.get_len(),
-            GGufArr::BoolArray(u) => u.get_len(),
-            GGufArr::StringArray(u) => u.len(),
-            _ => 0,
-        }
-    }
-}
-
-impl BinarySerialize for GGufArr {
-    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
-        let typ: GGufMetadataValueType = GGufMetadataValueType::deserialize(r)?;
-        let v = match typ {
-            GGufMetadataValueType::U8 => GGufArr::U8Array(GGufSliceData::<u8>::deserialize(r)?),
-            GGufMetadataValueType::I8 => GGufArr::I8Array(GGufSliceData::<i8>::deserialize(r)?),
-            GGufMetadataValueType::U16 => GGufArr::U16Array(GGufSliceData::<u16>::deserialize(r)?),
-            GGufMetadataValueType::I16 => GGufArr::I16Array(GGufSliceData::<i16>::deserialize(r)?),
-            GGufMetadataValueType::U32 => GGufArr::U32Array(GGufSliceData::<u32>::deserialize(r)?),
-            GGufMetadataValueType::I32 => GGufArr::I32Array(GGufSliceData::<i32>::deserialize(r)?),
-            GGufMetadataValueType::F32 => GGufArr::F32Array(GGufSliceData::<f32>::deserialize(r)?),
-            GGufMetadataValueType::F64 => GGufArr::F64Array(GGufSliceData::<f64>::deserialize(r)?),
-            GGufMetadataValueType::U64 => GGufArr::U64Array(GGufSliceData::<u64>::deserialize(r)?),
-            GGufMetadataValueType::I64 => GGufArr::I64Array(GGufSliceData::<i64>::deserialize(r)?),
-            GGufMetadataValueType::Bool => GGufArr::BoolArray(GGufSliceData::<u8>::deserialize(r)?),
-            GGufMetadataValueType::String => GGufArr::StringArray(Vec::<GGufStr>::deserialize(r)?),
-            _ => return Err(LLMError::UnknownArrayMetaType(typ)),
-        };
-        Ok(v)
-    }
-}
-
-enum GGufTypeValue {
-    U8(u8),
-    I8(i8),
-    U16(u16),
-    I16(i16),
-    U32(u32),
-    I32(i32),
-    U64(u64),
-    I64(i64),
-    F32(f32),
-    F64(f64),
-    Bool(u8),
-    String(GGufStr), //String(&'a str),
-}
-
-#[derive(Debug, Clone)]
-enum GGufMetadataValue {
-    U8(u8),
-    I8(i8),
-    U16(u16),
-    I16(i16),
-    U32(u32),
-    I32(i32),
-    U64(u64),
-    I64(i64),
-    F32(f32),
-    F64(f64),
-    Bool(u8),
-    String(GGufStr),
-    Array(GGufArr),
-}
-
-impl GGufMetadataValue {
-    fn get_u32(&self) -> Option<u32> {
-        match self {
-            GGufMetadataValue::U32(e) => Some(*e),
-            _ => None,
-        }
-    }
-
-    fn get_str(&self) -> Option<&str> {
-        match self {
-            GGufMetadataValue::String(e) => Some(e.as_str()),
-            _ => None,
-        }
-    }
-
-    fn get_f32(&self) -> Option<f32> {
-        match self {
-            GGufMetadataValue::F32(e) => Some(*e),
-            _ => None,
-        }
-    }
-
-    fn get_arr_n(&self) -> Option<usize> {
-        match self {
-            GGufMetadataValue::Array(e) => Some(e.get_len()),
-            _ => None,
-        }
-    }
-
-    fn get_str_arr(&self) -> Option<&[GGufStr]> {
-        match self {
-            GGufMetadataValue::Array(e) => match e {
-                GGufArr::StringArray(arr) => Some(arr),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    fn get_f32_arr(&self) -> Option<Vec<f32>> {
-        match self {
-            GGufMetadataValue::Array(e) => match e {
-                GGufArr::F32Array(arr) => Some(arr.to_vec()),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-}
-
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum GGufMetadataValueType {
-    U8 = 0,
-    I8 = 1,
-    U16 = 2,
-    I16 = 3,
-    U32 = 4,
-    I32 = 5,
-    F32 = 6,
-    Bool = 7,
-    String = 8,
-    Array = 9,
-    U64 = 10,
-    I64 = 11,
-    F64 = 12,
-}
-
-impl BinarySerialize for GGufMetadataValueType {
-    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
-        let t = u32::deserialize(r)?;
-        let v = match t {
-            0 => GGufMetadataValueType::U8,
-            1 => GGufMetadataValueType::I8,
-            2 => GGufMetadataValueType::U16,
-            3 => GGufMetadataValueType::I16,
-            4 => GGufMetadataValueType::U32,
-            5 => GGufMetadataValueType::I32,
-            6 => GGufMetadataValueType::F32,
-            7 => GGufMetadataValueType::Bool,
-            8 => GGufMetadataValueType::String,
-            9 => GGufMetadataValueType::Array,
-            10 => GGufMetadataValueType::U64,
-            11 => GGufMetadataValueType::I64,
-            12 => GGufMetadataValueType::F64,
-            _ => return Err(LLMError::UnknownMetaType(t)),
-        };
-        Ok(v)
-    }
-}
-
-impl BinarySerialize for u8 {
-    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
-        let u = r.read_u8()?;
-        Ok(u)
-    }
-}
-
-impl BinarySerialize for i8 {
-    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
-        let u = r.read_i8()?;
-        Ok(u)
-    }
-}
-
-impl BinarySerialize for u16 {
-    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
-        let u = r.read_u16::<Endian>()?;
-        Ok(u)
-    }
-}
-
-impl BinarySerialize for i16 {
-    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
-        let u = r.read_i16::<Endian>()?;
-        Ok(u)
-    }
-}
-
-impl BinarySerialize for i32 {
-    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
-        let u = r.read_i32::<Endian>()?;
-        Ok(u)
-    }
-}
-
-impl BinarySerialize for u32 {
-    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
-        let u = r.read_u32::<Endian>()?;
-        Ok(u)
-    }
-}
-
-impl BinarySerialize for f32 {
-    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
-        let u = r.read_f32::<Endian>()?;
-        Ok(u)
-    }
-}
-
-impl BinarySerialize for f64 {
-    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
-        let u = r.read_f64::<Endian>()?;
-        Ok(u)
-    }
-}
-
-impl BinarySerialize for u64 {
-    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
-        let u = r.read_u64::<Endian>()?;
-        Ok(u)
-    }
-}
-
-impl BinarySerialize for i64 {
-    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
-        let u = r.read_i64::<Endian>()?;
-        Ok(u)
-    }
-}
-
-impl BinarySerialize for usize {
-    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
-        let u = r.read_len()?;
-        Ok(u)
-    }
-}
-
-impl BinarySerialize for GGufMetadataValue {
-    fn deserialize<R: Read + GGufRead>(r: &mut R) -> LLMResult<Self> {
-        let t = GGufMetadataValueType::deserialize(r)?;
-        let v = match t {
-            GGufMetadataValueType::U8 => GGufMetadataValue::U8(u8::deserialize(r)?),
-            GGufMetadataValueType::I8 => GGufMetadataValue::I8(i8::deserialize(r)?),
-            GGufMetadataValueType::U16 => GGufMetadataValue::U16(u16::deserialize(r)?),
-            GGufMetadataValueType::I16 => GGufMetadataValue::I16(i16::deserialize(r)?),
-            GGufMetadataValueType::U32 => GGufMetadataValue::U32(u32::deserialize(r)?),
-            GGufMetadataValueType::I32 => GGufMetadataValue::I32(i32::deserialize(r)?),
-            GGufMetadataValueType::F32 => GGufMetadataValue::F32(f32::deserialize(r)?),
-            GGufMetadataValueType::F64 => GGufMetadataValue::F64(f64::deserialize(r)?),
-            GGufMetadataValueType::U64 => GGufMetadataValue::U64(u64::deserialize(r)?),
-            GGufMetadataValueType::I64 => GGufMetadataValue::I64(i64::deserialize(r)?),
-            GGufMetadataValueType::String => GGufMetadataValue::String(GGufStr::deserialize(r)?),
-            GGufMetadataValueType::Bool => GGufMetadataValue::Bool(u8::deserialize(r)?),
-            GGufMetadataValueType::Array => GGufMetadataValue::Array(GGufArr::deserialize(r)?),
-            // _=>return Err(LLMError::UnknownVersion(()))
-            //
-        };
-        Ok(v)
-    }
 }
 
 struct TensorContext {
@@ -707,7 +180,7 @@ fn new_tensor_3d<'a>(
     new_tensor(ctx, buf, 3, dtype, Shape::from_array(dim), dev)
 }
 
-fn new_tensor_4d<'a>(
+fn new_tensor_4d<'a, T: TensorProto>(
     ctx: &mut TensorContext,
     buf: &'a [u8],
     dtype: GGmlType,
@@ -716,7 +189,7 @@ fn new_tensor_4d<'a>(
     ne3: usize,
     ne4: usize,
     dev: &Device,
-) -> LLMResult<TensorView<'a>> {
+) -> LLMResult<T> {
     let dim = [ne0, ne1, ne3, ne4];
     new_tensor(ctx, buf, 2, dtype, Shape::from_array(dim), dev)
 }
@@ -912,46 +385,42 @@ fn cpy<'a, X: TensorProto, Y: TensorProto>(src: &X, dst: &mut Y) -> LLMResult<()
     Ok(())
 }
 
-fn cont_4d<'a, 'b: 'a>(
+fn cont_4d<'a, 'b: 'a, T: TensorProto>(
     ctx: &mut TensorContext,
     buf: &'a [u8],
-    a: &TensorView<'b>,
+    a: &T,
     ne0: usize,
     ne1: usize,
     ne2: usize,
     ne3: usize,
-) -> LLMResult<TensorView<'a>> {
+) -> LLMResult<T> {
     let mut dst = new_tensor_4d(ctx, buf, a.dtype(), ne0, ne1, ne2, ne3, a.device())?;
     galois::op::galois_cont(a, &mut dst)?;
     Ok(dst)
 }
 
-fn cont_2d<'a, 'b: 'a>(
+fn cont_2d<'a, 'b: 'a, T: TensorProto>(
     ctx: &mut TensorContext,
     buf: &'a [u8],
-    a: &TensorView<'b>,
+    a: &T,
     ne0: usize,
     ne1: usize,
-) -> LLMResult<TensorView<'a>> {
+) -> LLMResult<T> {
     cont_4d(ctx, buf, a, ne0, ne1, 1, 1)
 }
 
-fn unary<'a>(
+fn unary<'a, T: TensorProto>(
     ctx: &mut TensorContext,
     buf: &'a [u8],
-    a: &TensorView<'a>,
+    a: &T,
     op: UnaryOp,
-) -> LLMResult<TensorView<'a>> {
+) -> LLMResult<T> {
     let mut dst = dup_tensor(ctx, buf, a)?;
     galois::op::galois_unary(a, &mut dst, op)?;
     Ok(dst)
 }
 
-fn silu<'a>(
-    ctx: &mut TensorContext,
-    buf: &'a [u8],
-    a: &TensorView<'a>,
-) -> LLMResult<TensorView<'a>> {
+fn silu<'a, T: TensorProto>(ctx: &mut TensorContext, buf: &'a [u8], a: &T) -> LLMResult<T> {
     unary(ctx, buf, a, UnaryOp::Silu)
 }
 
@@ -1008,12 +477,12 @@ fn set_f32<'a>(a: &mut TensorView<'a>, value: f32) -> LLMResult<()> {
     Ok(())
 }
 
-fn add<'a>(
+fn add<'a, X: TensorProto, Y: TensorProto>(
     ctx: &mut TensorContext,
     buf: &'a [u8],
-    a: &TensorView<'a>,
-    b: &TensorView<'a>,
-) -> LLMResult<TensorView<'a>> {
+    a: &X,
+    b: &Y,
+) -> LLMResult<X> {
     let mut dst = dup_tensor(ctx, buf, a)?;
     galois::op::galois_add(a, b, &mut dst)?;
     Ok(dst)
@@ -1025,11 +494,7 @@ fn rms_norm<T: TensorProto>(ctx: &mut TensorContext, buf: &[u8], a: &T, eps: f32
     Ok(dst)
 }
 
-fn soft_max<'a>(
-    ctx: &mut TensorContext,
-    buf: &'a [u8],
-    a: &TensorView<'a>,
-) -> LLMResult<TensorView<'a>> {
+fn soft_max<'a, T: TensorProto>(ctx: &mut TensorContext, buf: &'a [u8], a: &T) -> LLMResult<T> {
     let mut dst = dup_tensor(ctx, buf, a)?;
     galois::op::galois_soft_max(a, &mut dst)?;
     Ok(dst)
@@ -1053,7 +518,12 @@ fn repeat<'a>(
     Ok(dst)
 }
 
-fn mul<T: TensorProto>(ctx: &mut TensorContext, buf: &[u8], a: &T, b: &T) -> LLMResult<T> {
+fn mul<X: TensorProto, Y: TensorProto>(
+    ctx: &mut TensorContext,
+    buf: &[u8],
+    a: &X,
+    b: &Y,
+) -> LLMResult<X> {
     let mut dst = dup_tensor(ctx, buf, a)?;
     galois::op::galois_mul(a, b, &mut dst)?;
     Ok(dst)
@@ -1089,12 +559,12 @@ fn scale_inplace<'a>(a: &'a TensorView<'a>, b: &'a TensorView<'a>) -> LLMResult<
     Ok(dst)
 }
 
-fn scale<'a>(
+fn scale<'a, X: TensorProto, Y: TensorProto>(
     ctx: &mut TensorContext,
     buf: &'a [u8],
-    a: &TensorView<'a>,
-    b: &TensorView<'a>,
-) -> LLMResult<TensorView<'a>> {
+    a: &X,
+    b: &Y,
+) -> LLMResult<X> {
     let mut dst = dup_tensor(ctx, buf, a)?;
     galois::op::galois_scale(a, b, &mut dst)?;
     Ok(dst)
@@ -1131,112 +601,35 @@ fn rope_custom<X: TensorProto, Y: TensorProto>(
     Ok(dst)
 }
 
-type LlamaToken = i32;
-type LlamaPos = i32;
-type LlamaSeqId = i32;
+// struct GptVocab {
+//     n_vocab: i32,
+//     token_to_id: HashMap<Token, LlamaToken>,
+//     id_to_token: HashMap<LlamaToken, Token>,
+// }
 
-type Token = String;
+// impl GptVocab {
+//     // fn load<T: Read + BufRead>(r: &mut T, n_vocab: i32) -> LLMResult<GptVocab> {
+//     //     let mut token_to_id: HashMap<Token, GptVocabId> = HashMap::new();
+//     //     let mut id_to_token: HashMap<GptVocabId, Token> = HashMap::new();
+//     //     for i in 0..n_vocab {
+//     //         let len: u32 = r.read_u32::<Endian>()?;
+//     //         let mut tmp = vec![0; len as usize];
+//     //         r.read_exact(&mut tmp)?;
+//     //         let word = String::from_utf8_lossy(&tmp).to_string();
+//     //         // if i == 1111 {
+//     //         //     println!("{}: vocab[{}] =       = {}\n", function!(), i, word);
+//     //         // }
+//     //         token_to_id.insert(word.clone(), i);
+//     //         id_to_token.insert(i, word);
+//     //     }
 
-struct GptVocab {
-    n_vocab: i32,
-    token_to_id: HashMap<Token, LlamaToken>,
-    id_to_token: HashMap<LlamaToken, Token>,
-}
-
-impl GptVocab {
-    // fn load<T: Read + BufRead>(r: &mut T, n_vocab: i32) -> LLMResult<GptVocab> {
-    //     let mut token_to_id: HashMap<Token, GptVocabId> = HashMap::new();
-    //     let mut id_to_token: HashMap<GptVocabId, Token> = HashMap::new();
-    //     for i in 0..n_vocab {
-    //         let len: u32 = r.read_u32::<Endian>()?;
-    //         let mut tmp = vec![0; len as usize];
-    //         r.read_exact(&mut tmp)?;
-    //         let word = String::from_utf8_lossy(&tmp).to_string();
-    //         // if i == 1111 {
-    //         //     println!("{}: vocab[{}] =       = {}\n", function!(), i, word);
-    //         // }
-    //         token_to_id.insert(word.clone(), i);
-    //         id_to_token.insert(i, word);
-    //     }
-
-    //     Ok(GptVocab {
-    //         n_vocab,
-    //         token_to_id,
-    //         id_to_token,
-    //     })
-    // }
-}
-
-struct LLamaVocab {
-    tokens: Vec<String>,
-    token_to_id: HashMap<Token, LlamaToken>,
-    token_scores: HashMap<LlamaToken, f32>,
-}
-
-impl LLamaVocab {
-    fn load(ctx: &GGufContext) -> LLMResult<LLamaVocab> {
-        let vocab = ctx
-            .metas_data()
-            .get(LLM_KV_TOKENIZER_LIST)
-            .unwrap()
-            .get_str_arr()
-            .unwrap()
-            .iter()
-            .map(|s| s.as_str().to_string())
-            .collect::<Vec<_>>();
-        let eos_token = ctx
-            .metas_data()
-            .get(LLM_KV_TOKENIZER_EOS_ID)
-            .unwrap()
-            .get_u32()
-            .unwrap() as usize;
-        let bos_token = ctx
-            .metas_data()
-            .get(LLM_KV_TOKENIZER_BOS_ID)
-            .unwrap()
-            .get_u32()
-            .unwrap() as usize;
-        let tokenizer_kind = ctx
-            .metas_data()
-            .get(LLM_KV_TOKENIZER_MODEL)
-            .unwrap()
-            .get_str()
-            .unwrap();
-        match tokenizer_kind {
-            "llama" => {
-                let vocab_scores = ctx
-                    .metas_data()
-                    .get(LLM_KV_TOKENIZER_SCORES)
-                    .unwrap()
-                    .get_f32_arr()
-                    .unwrap();
-                // .iter()
-                // .map(|s| *s)
-                // .collect::<Vec<_>>();
-                let token_ids = vocab
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| (v.clone(), i as i32))
-                    .collect::<HashMap<_, _>>();
-                let token_scores = vocab_scores
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, v)| (i as i32, v))
-                    .collect::<HashMap<_, _>>();
-                Ok(Self {
-                    tokens: vocab,
-                    token_to_id: token_ids,
-                    token_scores: token_scores,
-                })
-            }
-            _ => {
-                return Err(LLMError::UnknownModelArchitecture(
-                    tokenizer_kind.to_string(),
-                ))
-            }
-        }
-    }
-}
+//     //     Ok(GptVocab {
+//     //         n_vocab,
+//     //         token_to_id,
+//     //         id_to_token,
+//     //     })
+//     // }
+// }
 
 enum LLMArch {
     LLM_ARCH_LLAMA,
@@ -1308,44 +701,6 @@ struct CpuLayer<'a> {
     w3: TensorView<'a>,
 }
 
-pub enum ModelArchitecture {
-    Llama,
-    Gemma,
-    Qwen2,
-}
-
-impl ModelArchitecture {
-    fn decode(arch: &str) -> LLMResult<ModelArchitecture> {
-        let v = match arch {
-            "llama" => ModelArchitecture::Llama,
-            "gemma" => ModelArchitecture::Gemma,
-            "qwen2" => ModelArchitecture::Qwen2,
-            _ => return Err(LLMError::UnknownModelArchitecture(arch.to_string())),
-        };
-        Ok(v)
-    }
-}
-
-struct LlamaHparams {
-    architecture: ModelArchitecture,
-    model_name: String,
-    vocab_only: bool,
-    n_vocab: u32,
-    n_ctx_train: u32, // context size the model was trained on
-    n_head: u32,
-    n_embd: u32,
-    n_head_kv: u32,
-    n_layer: u32,
-    n_rot: u32,
-    n_ff: u32,
-
-    f_norm_eps: f32,
-    f_norm_rms_eps: f32,
-
-    rope_freq_base_train: f32,
-    rope_freq_scale_train: f32,
-}
-
 // impl Default for LlamaHparams {
 //     fn default() -> Self {
 //         Self {
@@ -1360,134 +715,6 @@ struct LlamaHparams {
 //         }
 //     }
 // }
-
-impl LlamaHparams {
-    fn load(r: &GGufContext) -> LLMResult<LlamaHparams> {
-        let model_name = r
-            .metas_data()
-            .get(LLM_KV_GENERAL_ARCHITECTURE)
-            .unwrap()
-            .get_str()
-            .unwrap();
-        let n_vocab = r
-            .metas_data()
-            .get(LLM_KV_TOKENIZER_LIST)
-            .unwrap()
-            .get_arr_n()
-            .unwrap();
-        let n_ctx_train = r
-            .metas_data()
-            .get(format!("{}{}", model_name, LLM_KV_CONTEXT_LENGTH).as_str())
-            .unwrap()
-            .get_u32()
-            .unwrap();
-        let n_embd = r
-            .metas_data()
-            .get(format!("{}{}", model_name, LLM_KV_EMBEDDING_LENGTH).as_str())
-            .unwrap()
-            .get_u32()
-            .unwrap();
-        let n_ff = r
-            .metas_data()
-            .get(format!("{}{}", model_name, LLM_KV_FEED_FORWARD_LENGTH).as_str())
-            .unwrap()
-            .get_u32()
-            .unwrap();
-        let n_head = r
-            .metas_data()
-            .get(format!("{}{}", model_name, LLM_KV_ATTENTION_HEAD_COUNT).as_str())
-            .unwrap()
-            .get_u32()
-            .unwrap();
-        let n_layer = r
-            .metas_data()
-            .get(format!("{}{}", model_name, LLM_KV_BLOCK_COUNT).as_str())
-            .unwrap()
-            .get_u32()
-            .unwrap();
-        let n_head_kv = r
-            .metas_data()
-            .get(format!("{}{}", model_name, LLM_KV_ATTENTION_HEAD_COUNT_KV).as_str())
-            .unwrap()
-            .get_u32()
-            .unwrap();
-
-        let rope_freq_base_train = r
-            .metas_data()
-            .get(format!("{}{}", model_name, LLM_KV_ROPE_FREQ_BASE).as_str())
-            .unwrap_or_else(|| &GGufMetadataValue::F32(10000.0f32))
-            .get_f32()
-            .unwrap();
-
-        let ropescale = r
-            .metas_data()
-            .get(format!("{}{}", model_name, LLM_KV_ROPE_SCALE_LINEAR).as_str())
-            .unwrap_or(&GGufMetadataValue::F32(1.0f32))
-            .get_f32()
-            .unwrap();
-
-        let rope_freq_scale_train = 1.0f32 / ropescale;
-
-        let n_rot = r
-            .metas_data()
-            .get(format!("{}{}", model_name, LLM_KV_ROPE_DIMENSION_COUNT).as_str())
-            .unwrap_or(&GGufMetadataValue::U32(n_embd / n_head))
-            .get_u32()
-            .unwrap();
-
-        println!("arch:{}", model_name);
-        println!("n_vocab:{}", n_vocab);
-        println!("n_ctx_train:{}", n_ctx_train);
-        println!("n_embd:{}", n_embd);
-        println!("n_ff:{}", n_ff);
-        println!("n_head:{}", n_head);
-        println!("n_layer:{}", n_layer);
-        println!("n_head_kv:{}", n_head_kv);
-        println!("rope_freq_base_train:{}", rope_freq_base_train);
-        println!("ropescale:{}", ropescale);
-        println!("n_rot:{}", n_rot);
-
-        Ok(Self {
-            architecture: ModelArchitecture::decode(model_name)?,
-            model_name: model_name.to_string(),
-            vocab_only: false,
-            n_vocab: n_vocab as u32,
-            n_ctx_train: n_ctx_train, // context size the model was trained on
-            n_head: n_head,
-            n_embd: n_embd,
-            n_head_kv: n_head_kv,
-            n_layer: n_layer,
-            n_rot: n_rot,
-            n_ff: n_ff,
-            f_norm_eps: 0.0e+00,
-            f_norm_rms_eps: 1.0e-05,
-            rope_freq_base_train: rope_freq_base_train,
-            rope_freq_scale_train: rope_freq_scale_train,
-        })
-    }
-
-    fn n_gqa(&self) -> u32 {
-        return self.n_head / self.n_head_kv;
-    }
-
-    fn n_embd_gqa(&self) -> u32 {
-        self.n_embd / self.n_gqa()
-    }
-
-    fn n_embd_head(&self) -> u32 {
-        self.n_embd / self.n_head
-    }
-}
-
-pub trait GGufRead {
-    fn read_bytes(&mut self, n: usize) -> LLMResult<&[u8]>;
-
-    fn read_len(&mut self) -> LLMResult<usize>;
-    // 返回当前 offset
-    fn offset(&self) -> usize;
-
-    fn cursor(&self) -> &[u8];
-}
 
 struct MmapReader {
     mmap: Mmap,
@@ -1582,10 +809,8 @@ impl Read for GGufMmapReader {
     }
 }
 
-type LLamaToken = u32;
-
 impl<'a> LlamaModel<'a> {
-    fn eval(llama_batch: Vec<LLamaToken>) {}
+    // fn eval(llama_batch: Vec<LLamaToken>) {}
 
     fn load<T: Read + GGufRead>(
         gguf_reader: &'a mut T,
@@ -2141,157 +1366,59 @@ fn open_file_stream(fname: &str) -> LLMResult<BufReader<File>> {
 
 const MAX_TOKEN_LEN: usize = 18;
 
-fn llama_tokenize(vocab: &GptVocab, text: &str, bos: bool) -> Vec<LlamaToken> {
-    let mut res: Vec<LlamaToken> = Vec::new();
-    let mut score: Vec<usize> = Vec::new();
-    let mut prev: Vec<LlamaToken> = Vec::new();
-    let len = text.len();
+// fn llama_tokenize(vocab: &GptVocab, text: &str, bos: bool) -> Vec<LlamaToken> {
+//     let mut res: Vec<LlamaToken> = Vec::new();
+//     let mut score: Vec<usize> = Vec::new();
+//     let mut prev: Vec<LlamaToken> = Vec::new();
+//     let len = text.len();
 
-    score.resize(len + 1, 0);
-    prev.resize(len + 1, 0);
+//     score.resize(len + 1, 0);
+//     prev.resize(len + 1, 0);
 
-    for i in 0..len {
-        let max_len = std::cmp::min(len - i, MAX_TOKEN_LEN);
-        for sub_len in 1..=max_len {
-            let sub = &text[i..i + sub_len];
-            if let Some(&token_id) = vocab.token_to_id.get(sub) {
-                let token_score = sub.len() * sub.len();
-                let local_score = score[i] + token_score;
-                let next = i + sub_len;
-                if score[next] < local_score {
-                    score[next] = local_score;
-                    prev[next] = token_id;
-                }
-            }
-        }
-    }
+//     for i in 0..len {
+//         let max_len = std::cmp::min(len - i, MAX_TOKEN_LEN);
+//         for sub_len in 1..=max_len {
+//             let sub = &text[i..i + sub_len];
+//             if let Some(&token_id) = vocab.token_to_id.get(sub) {
+//                 let token_score = sub.len() * sub.len();
+//                 let local_score = score[i] + token_score;
+//                 let next = i + sub_len;
+//                 if score[next] < local_score {
+//                     score[next] = local_score;
+//                     prev[next] = token_id;
+//                 }
+//             }
+//         }
+//     }
 
-    let mut i = len;
-    while i > 0 {
-        let token_id = prev[i];
-        if token_id == 0 {
-            // TODO: Return error or something more meaningful
-            eprintln!("failed to tokenize string!");
-            break;
-        }
-        res.push(token_id);
+//     let mut i = len;
+//     while i > 0 {
+//         let token_id = prev[i];
+//         if token_id == 0 {
+//             // TODO: Return error or something more meaningful
+//             eprintln!("failed to tokenize string!");
+//             break;
+//         }
+//         res.push(token_id);
 
-        if let Some(token) = vocab.id_to_token.get(&token_id) {
-            i -= token.len();
-        } else {
-            // Handle the case where token_id is not found in the vocabulary
-            eprintln!("token_id not found in vocabulary!");
-            break;
-        }
-    }
+//         if let Some(token) = vocab.id_to_token.get(&token_id) {
+//             i -= token.len();
+//         } else {
+//             // Handle the case where token_id is not found in the vocabulary
+//             eprintln!("token_id not found in vocabulary!");
+//             break;
+//         }
+//     }
 
-    if bos {
-        res.push(1); // TODO: replace with vocab.bos
-    }
+//     if bos {
+//         res.push(1); // TODO: replace with vocab.bos
+//     }
 
-    // Pieces are in reverse order so correct that
-    res.reverse();
+//     // Pieces are in reverse order so correct that
+//     res.reverse();
 
-    return res;
-}
-
-#[derive(Clone)]
-struct LlamaKvCell {
-    pos: LlamaPos,
-    delta: LlamaPos,
-    seq_id: HashSet<LlamaSeqId>,
-}
-
-impl Default for LlamaKvCell {
-    fn default() -> Self {
-        Self {
-            pos: -1,
-            delta: 0,
-            seq_id: HashSet::new(),
-        }
-    }
-}
-
-impl LlamaKvCell {
-    fn new() -> Self {
-        LlamaKvCell {
-            pos: -1,
-            delta: 0,
-            seq_id: HashSet::new(),
-        }
-    }
-
-    fn has_seq_id(&self, id: &LlamaSeqId) -> bool {
-        self.seq_id.contains(id)
-    }
-}
-
-struct LlamaKvCache {
-    head: usize,
-    size: usize,
-    n: usize,
-    cells: Vec<LlamaKvCell>,
-}
-
-impl LlamaKvCache {
-    fn new(n_ctx: usize) -> LlamaKvCache {
-        Self {
-            head: 0,
-            size: n_ctx,
-            n: 0,
-            cells: vec![LlamaKvCell::default(); n_ctx],
-        }
-    }
-
-    fn llama_kv_cache_find_slot(&mut self, batch: &LlamaBatch) -> bool {
-        let n_ctx = self.size;
-        let n_tokens = batch.n_token();
-
-        if n_tokens > n_ctx {
-            eprintln!("Error: n_tokens={} > n_ctx={}", n_tokens, n_ctx);
-            return false;
-        }
-
-        let mut n_tested = 0;
-
-        loop {
-            if (self.head + n_tokens) > n_ctx {
-                n_tested += n_ctx - self.head;
-                self.head = 0;
-                continue;
-            }
-
-            let mut found = true;
-            for i in 0..n_tokens {
-                if self.cells[self.head + i].pos >= 0 {
-                    found = false;
-                    self.head += i + 1;
-                    n_tested += i + 1;
-                    break;
-                }
-            }
-
-            if found {
-                break;
-            }
-
-            if n_tested >= n_ctx {
-                eprintln!("Error: n_tested={} > n_ctx={}", n_tested, n_ctx);
-                // Optionally log an error here if needed
-                return false;
-            }
-        }
-
-        // Final assignment of positions and seq_id for the batch tokens
-        for i in 0..n_tokens {
-            let index = self.head + i;
-            self.cells[index].pos = batch.pos[i];
-            self.cells[index].seq_id.insert(batch.seq_id[i]);
-        }
-
-        true
-    }
-}
+//     return res;
+// }
 
 fn llama_eval<'a>(
     model: &LlamaModel,
@@ -2389,6 +1516,8 @@ fn llama_eval<'a>(
         }
     }
 
+    let cuda_KQ_mask = KQ_mask.to_cuda_tensor(gpu_dev)?;
+
     let mut KQ_pos = new_tensor_1d(&mut tensor_ctx, &buf, GGmlType::I32, n_tokens, &Device::Cpu)?;
 
     unsafe {
@@ -2400,7 +1529,7 @@ fn llama_eval<'a>(
 
     let cuda_KQ_pos = KQ_pos.to_cuda_tensor(gpu_dev)?;
 
-    let cuda_inp_l = inp_l.to_cuda_tensor(gpu_dev)?;
+    let mut cuda_inp_l = inp_l.to_cuda_tensor(gpu_dev)?;
 
     for il in 0..n_gpu_layer as usize {
         let mut cur = rms_norm(&mut tensor_ctx, &buf, &cuda_inp_l, norm_rms_eps)?;
@@ -2413,6 +1542,8 @@ fn llama_eval<'a>(
         )?;
 
         let tmpk = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].wk, &cur)?;
+
+        let cpu_v = tmpk.to_cpu_tensor()?;
 
         let tmpk_reshape_3d = reshape_3d(&tmpk, n_embd_head, n_head_kv, n_tokens)?;
 
@@ -2484,35 +1615,68 @@ fn llama_eval<'a>(
             n_embd_head,
             n_embd_gqa * n_ctx * il, //memory_k.elem_size()
         )?;
-        println!(
-            "cuda K,shape:{:?} ,stride:{:?}",
-            K.dim().shape_layout(),
-            K.dim().stride_4d()
-        );
-        println!(
-            "cuda Q,shape:{:?} ,stride:{:?}",
-            Q.dim().shape_layout(),
-            Q.dim().stride_4d()
-        );
 
         let KQ: Tensor = matmul(&mut tensor_ctx, &buf, &K, &Q)?;
 
-        let cpu_v = KQ.to_cpu_tensor()?;
+        let KQ_scaled = scale(&mut tensor_ctx, &buf, &KQ, &KQ_scale)?;
 
-        let x: &[f32] = unsafe { cpu_v.as_slice::<f32>() };
-        let mut sum: f32 = 0.0;
-        for i in 0..cpu_v.elem_count() {
-            sum += x[i];
+        let KQ_masked = add(&mut tensor_ctx, &buf, &KQ_scaled, &cuda_KQ_mask)?;
+
+        let KQ_soft_max = soft_max(&mut tensor_ctx, &buf, &KQ_masked)?;
+
+        let V = view_3d(
+            &cuda_v,
+            n_kv,
+            n_embd_head,
+            n_head_kv,
+            n_ctx,
+            n_ctx * n_embd_head,
+            n_ctx * n_embd_gqa * il, //memory_v.elem_size()
+        )?;
+        let KQV = matmul(&mut tensor_ctx, &buf, &V, &KQ_soft_max)?;
+
+        let KQV_merged = permute(KQV, 0, 2, 1, 3)?;
+
+        cur = cont_2d(&mut tensor_ctx, &buf, &KQV_merged, n_embd, n_tokens)?;
+
+        cur = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].wo, &cur)?;
+        let inpFF = add(&mut tensor_ctx, &buf, &cur, &cuda_inp_l)?;
+
+        // feed-forward network
+        {
+            {
+                cur = rms_norm(&mut tensor_ctx, &buf, &inpFF, norm_rms_eps)?;
+
+                cur = mul(&mut tensor_ctx, &buf, &cur, &model.gpu_layers[il].ffn_norm)?;
+            }
+
+            let tmp = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].w3, &cur)?;
+            cur = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].w1, &cur)?;
+
+            // SILU activation
+            cur = silu(&mut tensor_ctx, &buf, &cur)?;
+
+            cur = mul(&mut tensor_ctx, &buf, &cur, &tmp)?;
+
+            cur = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].w2, &cur)?;
         }
-        println!(
-            "{} cuda cur,sum:{:?},shape:{:?},stride:{:?}",
-            "KQ",
-            sum,
-            cpu_v.shape_layout(),
-            cpu_v.dim().stride_4d()
-        );
-        return Ok(());
+
+        cur = add(&mut tensor_ctx, &buf, &cur, &inpFF)?;
+
+        // input for next layer
+        cuda_inp_l = cur;
     }
+
+    let mut cur = cuda_inp_l;
+
+    {
+        cur = rms_norm(&mut tensor_ctx, &buf, &cur, norm_rms_eps)?;
+
+        cur = mul(&mut tensor_ctx, &buf, &cur, &model.output_norm)?;
+    }
+
+    // // lm_head
+    // cur = matmul(&mut tensor_ctx, &buf, &model.output, &cur)?;
 
     //let mut Qcur: Option<TensorView<'_>> = None;
 
@@ -2613,43 +1777,9 @@ fn llama_eval<'a>(
 
             let KQ = matmul(&mut tensor_ctx, &buf, &K, &Q)?;
 
-            let x: &[f32] = unsafe { KQ.as_slice::<f32>() };
-            let mut sum: f32 = 0.0;
-            for i in 0..KQ.elem_count() {
-                if i < 10 {
-                    println!("KQ:{:?}", x[i]);
-                }
-                sum += x[i];
-            }
-            println!(
-                "{} cpu cur,sum:{:?},shape:{:?},stride:{:?}",
-                "KQ",
-                sum,
-                KQ.shape_layout(),
-                KQ.dim().stride_4d()
-            );
-            return Ok(());
-
-            let x: &[f32] = unsafe { K.as_slice::<f32>() };
-            let mut sum: f32 = 0.0;
-            for i in 0..Q.elem_count() {
-                if i < 10 {
-                    println!("KQ:{:?}", x[i]);
-                }
-                sum += x[i];
-            }
-            println!(
-                "{} cpu cur,sum:{:?},shape:{:?},stride:{:?}",
-                "K",
-                sum,
-                K.shape_layout(),
-                K.dim().stride_4d()
-            );
-            return Ok(());
-
             let KQ_scaled = scale(&mut tensor_ctx, &buf, &KQ, &KQ_scale)?;
 
-            let KQ_masked = add(&mut tensor_ctx, &buf, &KQ_scaled, &KQ_mask)?;
+            let KQ_masked: TensorView = add(&mut tensor_ctx, &buf, &KQ_scaled, &KQ_mask)?;
 
             let KQ_soft_max = soft_max(&mut tensor_ctx, &buf, &KQ_masked)?;
 
@@ -2693,6 +1823,21 @@ fn llama_eval<'a>(
 
             cur = add(&mut tensor_ctx, &buf, &cur, &inpFF)?;
         }
+
+        let x: &[f32] = unsafe { cur.as_slice::<f32>() };
+        let mut sum: f32 = 0.0;
+        for i in 0..cur.elem_count() {
+            sum += x[i];
+        }
+        println!(
+            "{} cpu cur,sum:{:?},shape:{:?},stride:{:?}",
+            "KQ",
+            sum,
+            cur.shape_layout(),
+            cur.dim().stride_4d()
+        );
+        return Ok(());
+
         inp_l = cur;
         // input for next layer
     }
@@ -2751,36 +1896,6 @@ impl BinarySerialize for GGmlType {
     }
 }
 
-struct GGufContext {
-    header: GGufHeader,
-    metas: HashMap<GGufStr, GGufMetadataValue>,
-    //   tensor_infos: HashMap<GGufStr, GGufDiskTensorInfo>,
-}
-
-impl GGufContext {
-    fn metas_data(&self) -> &HashMap<GGufStr, GGufMetadataValue> {
-        &self.metas
-    }
-}
-
-struct GGufHeader {
-    magic: u32,
-    version: GGufVersion,
-    n_tensors: u64,
-    n_kv: u64,
-}
-
-struct GGufKV {
-    key: GGufStr,
-    value: GGufMetadataValue,
-}
-
-impl GGufKV {
-    fn new(key: GGufStr, value: GGufMetadataValue) -> GGufKV {
-        Self { key, value }
-    }
-}
-
 const GGUF_DEFAULT_ALIGNMENT: usize = 32;
 
 fn ggml_pad(x: usize, n: usize) -> usize {
@@ -2818,56 +1933,6 @@ impl GGufDiskTensorInfo {
     }
 }
 
-impl GGufHeader {
-    fn load<T: Read>(r: &mut T) -> LLMResult<GGufHeader> {
-        let magic = r.read_u32::<Endian>()?;
-        if magic != GGUF_MAGIC {
-            return Err(LLMError::BadMagic(magic));
-        }
-        let version = GGufVersion::decode(r.read_u32::<Endian>()?)?;
-        let n_tensors = r.read_u64::<Endian>()?;
-        let n_kv = r.read_u64::<Endian>()?;
-        println!(
-            "magic:{:x}, version:{:?},n_tensors:{},n_kv:{}",
-            magic, version, n_tensors, n_kv,
-        );
-        Ok(GGufHeader {
-            magic: magic,
-            version: version,
-            n_tensors: n_tensors,
-            n_kv: n_kv,
-        })
-    }
-
-    fn magic(&self) -> u32 {
-        self.magic
-    }
-
-    fn n_tensors(&self) -> usize {
-        self.n_tensors as usize
-    }
-
-    fn n_kv(&self) -> usize {
-        self.n_kv as usize
-    }
-}
-
-struct LlamaBatch {
-    token: Vec<LlamaToken>,
-    pos: Vec<LlamaPos>,
-    seq_id: Vec<LlamaSeqId>,
-}
-
-impl LlamaBatch {
-    fn n_token(&self) -> usize {
-        self.token.len()
-    }
-
-    fn embd_inp(&self) -> &[LlamaToken] {
-        &self.token
-    }
-}
-
 fn gguf_read() -> LLMResult<()> {
     let model_path = "/opt/cproject/llama.cpp-gguf-fix-publish/models/llama-2-7b.Q4_0.gguf";
     let file = OpenOptions::new().read(true).open(model_path)?;
@@ -2879,7 +1944,7 @@ fn gguf_read() -> LLMResult<()> {
     };
     let mut mmap_reader = MmapReader::new(mmap, file_size as usize);
     let header = GGufHeader::load(&mut mmap_reader)?;
-    let mut gguf_reader = GGufMmapReader::new(mmap_reader, header.version.clone());
+    let mut gguf_reader = GGufMmapReader::new(mmap_reader, header.version().clone());
 
     let n_kv = header.n_kv();
     let mut gg_kvs: HashMap<GGufStr, GGufMetadataValue> = HashMap::new();
@@ -2908,15 +1973,28 @@ fn gguf_read() -> LLMResult<()> {
     let gguf_ctx = GGufContext {
         header: header,
         metas: gg_kvs,
-        // tensor_infos: gg_tensor_infos,
     };
     let h = LlamaHparams::load(&gguf_ctx)?;
     let vocab = LLamaVocab::load(&gguf_ctx)?;
+
+    let output = tokenize(&vocab, "what is computer english".to_string(), true)?;
+    println!("{:?}", output);
+    // let mut output = Vec::new();
+    //let mut t = LLMtokenizerSpm::new(&vocab);
+    // let mut s = "who am i".to_string();
+    // s.insert(0, ' ');
+    // replace_all(&mut s, " ", "▁");
+    // t.tokenize(&s, &mut output)?;
+    // println!("out:{:?}", output);
+    return Ok(());
+
     let gpu = CudaDevice::new(0)?;
     init_cuda_function(&gpu)?;
     let gpu_dev = Device::Gpu(gpu);
     let n_gpu_layer = 0;
     let model = LlamaModel::load(&mut gguf_reader, h, gg_tensor_infos, &gpu_dev, n_gpu_layer)?;
+
+    //解析token
 
     let tokens = vec![1i32, 2];
 
