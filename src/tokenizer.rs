@@ -1,7 +1,9 @@
 use crate::common::LLMError;
 use crate::meta::LLMVocabType;
 use crate::meta::LlamaToken;
+use crate::meta::LlamaVocabPreType;
 use crate::unicode;
+use crate::unicode::unicode_regex_split;
 use crate::LLMResult;
 use crate::LLamaVocab;
 use std::cmp::Ordering;
@@ -92,7 +94,6 @@ pub struct LLMtokenizerSpm<'a> {
     symbols: Vec<LLMSymbol<'a>>,
     work_queue: BinaryHeap<LlmBigramSpm>,
     rev_merge: HashMap<String, (i32, i32)>,
-    _marker: PhantomData<&'a ()>,
 }
 
 impl<'a> LLMtokenizerSpm<'a> {
@@ -102,7 +103,6 @@ impl<'a> LLMtokenizerSpm<'a> {
             symbols: Vec::new(),
             work_queue: BinaryHeap::new(),
             rev_merge: HashMap::new(),
-            _marker: PhantomData,
         }
     }
 
@@ -259,6 +259,51 @@ fn llama_byte_to_token(vocab: &LLamaVocab, ch: u8) -> LLMResult<LlamaToken> {
             let id = *vocab.token_to_id.get(&key).or_else(|| Some(&0)).unwrap();
             Ok(id)
         }
+    }
+}
+
+struct LLMtokenizerBpe<'a> {
+    vocab: &'a LLamaVocab,
+    symbols: Vec<LLMSymbol<'a>>,
+    symbols_final: Vec<LLMSymbol<'a>>,
+    regex_exprs: Vec<&'static str>,
+}
+
+impl<'a> LLMtokenizerBpe<'a> {
+    pub(crate) fn new(vocab: &'a LLamaVocab) -> Self {
+        //   assert!(vocab.get_vocab_type() == LLAMA_VOCAB_TYPE_BPE);
+        let regex_exprs = match vocab.get_pre_type() {
+            LlamaVocabPreType::LLAMA_VOCAB_PRE_TYPE_LLAMA3 => {
+                [
+                    // original regex from tokenizer.json
+                    //"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+
+                    // adapted: https://github.com/ggerganov/llama.cpp/pull/6920#issuecomment-2080233989
+                    "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+                    ].to_vec()
+            }
+            _ => {
+                todo!()
+            }
+        };
+        LLMtokenizerBpe {
+            vocab: vocab,
+            symbols: Vec::new(),
+            symbols_final: Vec::new(),
+            regex_exprs: regex_exprs,
+        }
+    }
+
+    pub(crate) fn tokenize(
+        &'a mut self,
+        text: &'a str,
+        output: &mut Vec<LlamaToken>,
+    ) -> LLMResult<()> {
+        let final_prev_index = -1;
+        let word_collection = unicode_regex_split(text, &self.regex_exprs);
+
+        self.symbols_final.clear();
+        Ok(())
     }
 }
 

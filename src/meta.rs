@@ -6,7 +6,10 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
+use std::hash::DefaultHasher;
 use std::hash::Hash;
+use std::hash::Hasher;
+use std::intrinsics::forget;
 use std::io::Read;
 use std::ptr::NonNull;
 
@@ -26,9 +29,13 @@ pub(crate) const LLM_KV_ATTENTION_HEAD_COUNT_KV: &'static str = ".attention.head
 pub(crate) const LLM_KV_ROPE_FREQ_BASE: &'static str = ".rope.freq_base";
 pub(crate) const LLM_KV_ROPE_SCALE_LINEAR: &'static str = ".rope.scale_linear";
 pub(crate) const LLM_KV_ROPE_DIMENSION_COUNT: &'static str = ".rope.dimension_count";
+pub(crate) const LLM_KV_ATTENTION_KEY_LENGTH: &'static str = ".attention.key_length";
+pub(crate) const LLM_KV_ATTENTION_VALUE_LENGTH: &'static str = ".attention.value_length";
+pub(crate) const LLM_KV_EXPERT_COUNT: &'static str = ".expert_count";
 
 pub(crate) const LLM_KV_TOKENIZER_MODEL: &'static str = "tokenizer.ggml.model";
 pub(crate) const LLM_KV_TOKENIZER_TOKEN_TYPE: &'static str = "tokenizer.ggml.token_type";
+pub(crate) const LLM_KV_TOKENIZER_PRE: &'static str = "tokenizer.ggml.pre";
 pub(crate) const LLM_KV_TOKENIZER_SCORES: &'static str = "tokenizer.ggml.scores";
 pub(crate) const LLM_KV_TOKENIZER_MERGES: &'static str = "tokenizer.ggml.merges";
 pub(crate) const LLM_KV_TOKENIZER_BOS_ID: &'static str = "tokenizer.ggml.bos_token_id";
@@ -46,39 +53,18 @@ pub(crate) type LlamaPos = i32;
 pub(crate) type LlamaSeqId = i32;
 pub(crate) type ID = i32;
 
-enum TokenType {
-    LLAMA_TOKEN_TYPE_UNDEFINED = 0,
-    LLAMA_TOKEN_TYPE_NORMAL = 1,
-    LLAMA_TOKEN_TYPE_UNKNOWN = 2,
-    LLAMA_TOKEN_TYPE_CONTROL = 3,
-    LLAMA_TOKEN_TYPE_USER_DEFINED = 4,
-    LLAMA_TOKEN_TYPE_UNUSED = 5,
-    LLAMA_TOKEN_TYPE_BYTE = 6,
-}
-
-impl TryFrom<i32> for TokenType {
-    type Error = &'static str;
-
-    fn try_from(value: i32) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(TokenType::LLAMA_TOKEN_TYPE_UNDEFINED),
-            1 => Ok(TokenType::LLAMA_TOKEN_TYPE_NORMAL),
-            2 => Ok(TokenType::LLAMA_TOKEN_TYPE_UNKNOWN),
-            3 => Ok(TokenType::LLAMA_TOKEN_TYPE_CONTROL),
-            4 => Ok(TokenType::LLAMA_TOKEN_TYPE_USER_DEFINED),
-            5 => Ok(TokenType::LLAMA_TOKEN_TYPE_UNUSED),
-            6 => Ok(TokenType::LLAMA_TOKEN_TYPE_BYTE),
-            _ => Err("Invalid TokenType value"),
-        }
-    }
-}
-
-type Token = String;
-
-pub(crate) struct TokenData {
-    pub(crate) text: Token,
-    pub(crate) score: f32,
-    pub(crate) ty: TokenType,
+enum LlamaTokenAttr {
+    LLAMA_TOKEN_ATTR_UNDEFINED = 0,
+    LLAMA_TOKEN_ATTR_UNKNOWN = 1 << 0,
+    LLAMA_TOKEN_ATTR_UNUSED = 1 << 1,
+    LLAMA_TOKEN_ATTR_NORMAL = 1 << 2,
+    LLAMA_TOKEN_ATTR_CONTROL = 1 << 3, // SPECIAL?
+    LLAMA_TOKEN_ATTR_USER_DEFINED = 1 << 4,
+    LLAMA_TOKEN_ATTR_BYTE = 1 << 5,
+    LLAMA_TOKEN_ATTR_NORMALIZED = 1 << 6,
+    LLAMA_TOKEN_ATTR_LSTRIP = 1 << 7,
+    LLAMA_TOKEN_ATTR_RSTRIP = 1 << 8,
+    LLAMA_TOKEN_ATTR_SINGLE_WORD = 1 << 9,
 }
 
 #[derive(Default)]
@@ -89,16 +75,101 @@ pub(crate) enum LLMVocabType {
 }
 
 #[derive(Default)]
+pub(crate) enum LlamaVocabPreType {
+    #[default]
+    LLAMA_VOCAB_PRE_TYPE_DEFAULT = 0,
+    LLAMA_VOCAB_PRE_TYPE_LLAMA3 = 1,
+    LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_LLM = 2,
+    LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_CODER = 3,
+    LLAMA_VOCAB_PRE_TYPE_FALCON = 4,
+    LLAMA_VOCAB_PRE_TYPE_MPT = 5,
+    LLAMA_VOCAB_PRE_TYPE_STARCODER = 6,
+    LLAMA_VOCAB_PRE_TYPE_GPT2 = 7,
+    LLAMA_VOCAB_PRE_TYPE_REFACT = 8,
+    LLAMA_VOCAB_PRE_TYPE_COMMAND_R = 9,
+    LLAMA_VOCAB_PRE_TYPE_STABLELM2 = 10,
+    LLAMA_VOCAB_PRE_TYPE_QWEN2 = 11,
+    LLAMA_VOCAB_PRE_TYPE_OLMO = 12,
+    LLAMA_VOCAB_PRE_TYPE_DBRX = 13,
+    LLAMA_VOCAB_PRE_TYPE_SMAUG = 14,
+    LLAMA_VOCAB_PRE_TYPE_PORO = 15,
+    LLAMA_VOCAB_PRE_TYPE_CHATGLM3 = 16,
+    LLAMA_VOCAB_PRE_TYPE_CHATGLM4 = 17,
+    LLAMA_VOCAB_PRE_TYPE_VIKING = 18,
+    LLAMA_VOCAB_PRE_TYPE_JAIS = 19,
+    LLAMA_VOCAB_PRE_TYPE_TEKKEN = 20,
+    LLAMA_VOCAB_PRE_TYPE_SMOLLM = 21,
+    LLAMA_VOCAB_PRE_TYPE_CODESHELL = 22,
+    LLAMA_VOCAB_PRE_TYPE_BLOOM = 23,
+    LLAMA_VOCAB_PRE_TYPE_GPT3_FINNISH = 24,
+    LLAMA_VOCAB_PRE_TYPE_EXAONE = 25,
+    LLAMA_VOCAB_PRE_TYPE_CHAMELEON = 26,
+    LLAMA_VOCAB_PRE_TYPE_MINERVA = 27,
+    LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM = 28,
+}
+
+// impl TryFrom<i32> for LlamaTokenAttr {
+//     type Error = &'static str;
+
+//     fn try_from(value: i32) -> Result<Self, Self::Error> {
+//         match value {
+//             0 => Ok(TokenType::LLAMA_TOKEN_TYPE_UNDEFINED),
+//             1 => Ok(TokenType::LLAMA_TOKEN_TYPE_NORMAL),
+//             2 => Ok(TokenType::LLAMA_TOKEN_TYPE_UNKNOWN),
+//             3 => Ok(TokenType::LLAMA_TOKEN_TYPE_CONTROL),
+//             4 => Ok(TokenType::LLAMA_TOKEN_TYPE_USER_DEFINED),
+//             5 => Ok(TokenType::LLAMA_TOKEN_TYPE_UNUSED),
+//             6 => Ok(TokenType::LLAMA_TOKEN_TYPE_BYTE),
+//             _ => Err("Invalid TokenType value"),
+//         }
+//     }
+// }
+
+type Token = String;
+
+pub(crate) struct TokenData {
+    pub(crate) text: Token,
+    pub(crate) score: f32,
+    pub(crate) ty: LlamaTokenAttr,
+}
+
+impl TokenData {
+    pub(crate) fn str(&self) -> &str {
+        &self.text
+    }
+}
+
+#[derive(Eq, PartialEq, Hash)]
+struct StringPair(String, String);
+
+struct PairHash;
+
+impl PairHash {
+    fn hash(pair: &StringPair) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        pair.0.hash(&mut hasher);
+        pair.1.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+#[derive(Default)]
 pub(crate) struct LLamaVocab {
     pub(crate) id_to_token: Vec<TokenData>,
     pub(crate) token_to_id: HashMap<Token, LlamaToken>,
     //token_scores: HashMap<LlamaToken, f32>,
     vocab_type: LLMVocabType,
+    pre_type: LlamaVocabPreType,
     pub(crate) special_bos_id: ID,
     special_eos_id: ID,
     special_unk_id: ID,
     special_sep_id: ID,
     special_pad_id: ID,
+
+    pub(crate) bpe_ranks: HashMap<StringPair, i32>,
+
+    ignore_merges: bool,
+    add_bos: bool,
 }
 
 impl LLamaVocab {
@@ -130,54 +201,93 @@ impl LLamaVocab {
             .unwrap()
             .get_str()
             .unwrap();
+
+        let tokenizer_pre = ctx
+            .metas_data()
+            .get(LLM_KV_TOKENIZER_PRE)
+            .unwrap()
+            .get_str()
+            .unwrap();
+
+        let mut vocab_scores = None;
+
+        ctx.get_arr_f32(LLM_KV_TOKENIZER_SCORES, &mut vocab_scores, false);
+
+        let mut tok_types = None;
+
+        ctx.get_arr_i32(LLM_KV_TOKENIZER_TOKEN_TYPE, &mut tok_types, false);
+
+        // let tok_types = ctx
+        //     .metas_data()
+        //     .get(LLM_KV_TOKENIZER_TOKEN_TYPE)
+        //     .unwrap()
+        //     .get_i32_arr()
+        //     .unwrap();
+
+        let token_ids = vocab
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (v.clone(), i as i32))
+            .collect::<HashMap<_, _>>();
+        // let token_scores = vocab_scores
+        //     .iter()
+        //     .enumerate()
+        //     .map(|(i, v)| (i as i32, v))
+        //     .collect::<HashMap<_, _>>();
+        let n_vocab = ctx
+            .metas_data()
+            .get(LLM_KV_TOKENIZER_LIST)
+            .unwrap()
+            .get_arr_n()
+            .unwrap();
+        let mut id_to_token = Vec::new();
+        for i in 0..n_vocab {
+            id_to_token.push(TokenData {
+                text: vocab[i].clone(),
+                score: match vocab_scores.as_ref() {
+                    Some(v) => (*v)[i],
+                    None => 0.0f32,
+                },
+                ty: LlamaTokenAttr::LLAMA_TOKEN_ATTR_NORMAL,
+            })
+        }
+
+        let mut vocab_type = LLMVocabType::SPM;
+
+        let mut pre_type = LlamaVocabPreType::default();
+
+        let mut special_bos_id: i32 = 0;
+        let mut special_eos_id = 2;
+        let mut special_unk_id = 0;
+        let mut special_sep_id = -1;
+        let mut special_pad_id = -1;
+
+        let mut ignore_merges = false;
+        let mut add_bos = false;
+
         match tokenizer_kind {
             "llama" => {
-                let vocab_scores = ctx
+                vocab_type = LLMVocabType::SPM;
+                special_bos_id = 1;
+                special_eos_id = 2;
+                special_unk_id = 0;
+                special_sep_id = -1;
+                special_pad_id = -1;
+            }
+            "gpt2" => {
+                let n_merges = ctx
                     .metas_data()
-                    .get(LLM_KV_TOKENIZER_SCORES)
-                    .unwrap()
-                    .get_f32_arr()
-                    .unwrap();
-                let tok_types = ctx
-                    .metas_data()
-                    .get(LLM_KV_TOKENIZER_TOKEN_TYPE)
-                    .unwrap()
-                    .get_i32_arr()
-                    .unwrap();
-                let token_ids = vocab
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| (v.clone(), i as i32))
-                    .collect::<HashMap<_, _>>();
-                // let token_scores = vocab_scores
-                //     .iter()
-                //     .enumerate()
-                //     .map(|(i, v)| (i as i32, v))
-                //     .collect::<HashMap<_, _>>();
-                let n_vocab = ctx
-                    .metas_data()
-                    .get(LLM_KV_TOKENIZER_LIST)
+                    .get(LLM_KV_TOKENIZER_MERGES)
                     .unwrap()
                     .get_arr_n()
                     .unwrap();
-                let mut id_to_token = Vec::new();
-                for i in 0..n_vocab {
-                    id_to_token.push(TokenData {
-                        text: vocab[i].clone(),
-                        score: vocab_scores[i],
-                        ty: TokenType::try_from(tok_types[i])?,
-                    })
-                }
-                Ok(Self {
-                    id_to_token: id_to_token,
-                    token_to_id: token_ids,
-                    vocab_type: LLMVocabType::SPM,
-                    special_bos_id: 1,
-                    special_eos_id: 2,
-                    special_unk_id: 0,
-                    special_sep_id: -1,
-                    special_pad_id: -1,
-                })
+                println!("n_merges:{}", n_merges);
+                vocab_type = LLMVocabType::SPM;
+                special_bos_id = 1;
+                special_eos_id = 2;
+                special_unk_id = 0;
+                special_sep_id = -1;
+                special_pad_id = -1;
             }
             _ => {
                 return Err(LLMError::UnknownModelArchitecture(
@@ -185,10 +295,41 @@ impl LLamaVocab {
                 ))
             }
         }
+
+        match vocab_type {
+            LLMVocabType::SPM => {}
+            LLMVocabType::BPE => match tokenizer_pre {
+                "llama-bpe" => {
+                    pre_type = LlamaVocabPreType::LLAMA_VOCAB_PRE_TYPE_LLAMA3;
+                    ignore_merges = true;
+                    add_bos = true;
+                }
+                _ => {}
+            },
+        }
+
+        return Ok(Self {
+            id_to_token: id_to_token,
+            token_to_id: token_ids,
+            vocab_type: LLMVocabType::SPM,
+            pre_type: pre_type,
+            special_bos_id: 1,
+            special_eos_id: 2,
+            special_unk_id: 0,
+            special_sep_id: -1,
+            special_pad_id: -1,
+            add_bos: add_bos,
+            ignore_merges: ignore_merges,
+            bpe_ranks: HashMap::new(),
+        });
     }
 
     pub(crate) fn get_vocab_type(&self) -> &LLMVocabType {
         &self.vocab_type
+    }
+
+    pub(crate) fn get_pre_type(&self) -> &LlamaVocabPreType {
+        &self.pre_type
     }
 }
 
@@ -223,11 +364,22 @@ pub(crate) struct LlamaHparams {
     pub(crate) n_rot: u32,
     pub(crate) n_ff: u32,
 
+    pub(crate) n_embd_head_k: u32, // dimension of keys (d_k). d_q is assumed to be the same, but there are n_head q heads, and only n_head_kv k-v heads
+    pub(crate) n_embd_head_v: u32, // dimension of values (d_v) aka n_embd_head
+
+    // 在 llama.cpp 中，n_expert 主要用于 Mixture of Experts (MoE) 模型，比如 Mixtral (Mistral MoE 8x7B) 这样的架构。
+    // n_expert 作用：
+    // n_expert 指的是 每次推理时激活的专家 (Experts) 数量，适用于 MoE（Mixture of Experts）架构的模型。
+    // 在 MoE 模型中，多个专家（Experts）组成一个专家池，但每次推理时并不会全部使用，而是只选取一部分最适合当前输入的专家进行计算，以提高计算效率
+    pub(crate) n_expert: u32,
+
     pub(crate) f_norm_eps: f32,
     pub(crate) f_norm_rms_eps: f32,
 
     pub(crate) rope_freq_base_train: f32,
     pub(crate) rope_freq_scale_train: f32,
+
+    pub(crate) n_head_arr: Vec<u32>,
 }
 
 impl LlamaHparams {
@@ -262,12 +414,12 @@ impl LlamaHparams {
             .unwrap()
             .get_u32()
             .unwrap();
-        let n_head = r
-            .metas_data()
-            .get(format!("{}{}", model_name, LLM_KV_ATTENTION_HEAD_COUNT).as_str())
-            .unwrap()
-            .get_u32()
-            .unwrap();
+        // let n_head = r
+        //     .metas_data()
+        //     .get(format!("{}{}", model_name, LLM_KV_ATTENTION_HEAD_COUNT).as_str())
+        //     .unwrap()
+        //     .get_u32()
+        //     .unwrap();
         let n_layer = r
             .metas_data()
             .get(format!("{}{}", model_name, LLM_KV_BLOCK_COUNT).as_str())
@@ -295,7 +447,23 @@ impl LlamaHparams {
             .get_f32()
             .unwrap();
 
+        let n_expert = r
+            .metas_data()
+            .get(format!("{}{}", model_name, LLM_KV_EXPERT_COUNT).as_str())
+            .unwrap_or(&GGufMetadataValue::U32(0))
+            .get_u32()
+            .unwrap();
+
         let rope_freq_scale_train = 1.0f32 / ropescale;
+
+        let mut n_head_arr = vec![0u32; n_layer as usize];
+
+        r.metas_data()
+            .get(format!("{}{}", model_name, LLM_KV_ATTENTION_HEAD_COUNT).as_str())
+            .unwrap()
+            .get_key_or_arr_u32(&mut n_head_arr);
+
+        let n_head = n_head_arr[0];
 
         let n_rot = r
             .metas_data()
@@ -304,35 +472,81 @@ impl LlamaHparams {
             .get_u32()
             .unwrap();
 
-        println!("arch:{}", model_name);
-        println!("n_vocab:{}", n_vocab);
-        println!("n_ctx_train:{}", n_ctx_train);
-        println!("n_embd:{}", n_embd);
-        println!("n_ff:{}", n_ff);
-        println!("n_head:{}", n_head);
-        println!("n_layer:{}", n_layer);
-        println!("n_head_kv:{}", n_head_kv);
-        println!("rope_freq_base_train:{}", rope_freq_base_train);
-        println!("ropescale:{}", ropescale);
-        println!("n_rot:{}", n_rot);
+        // let n_head_count = r
+        //     .metas_data()
+        //     .get(format!("{}{}", model_name, LLM_KV_ATTENTION_HEAD_COUNT).as_str())
+        //     .unwrap()
+        //     .get_u32()
+        //     .unwrap();
 
-        Ok(Self {
-            architecture: ModelArchitecture::decode(model_name)?,
-            model_name: model_name.to_string(),
-            vocab_only: false,
-            n_vocab: n_vocab as u32,
-            n_ctx_train: n_ctx_train, // context size the model was trained on
-            n_head: n_head,
-            n_embd: n_embd,
-            n_head_kv: n_head_kv,
-            n_layer: n_layer,
-            n_rot: n_rot,
-            n_ff: n_ff,
-            f_norm_eps: 0.0e+00,
-            f_norm_rms_eps: 1.0e-05,
-            rope_freq_base_train: rope_freq_base_train,
-            rope_freq_scale_train: rope_freq_scale_train,
-        })
+        if n_head > 0 {
+            let mut n_embd_head_k = n_embd / n_head;
+            r.get_u32(
+                format!("{}{}", model_name, LLM_KV_ATTENTION_KEY_LENGTH).as_str(),
+                &mut n_embd_head_k,
+                false,
+            );
+            let mut n_embd_head_v = n_embd / n_head;
+            r.get_u32(
+                format!("{}{}", model_name, LLM_KV_ATTENTION_VALUE_LENGTH).as_str(),
+                &mut n_embd_head_k,
+                false,
+            );
+
+            let mut n_rot = n_embd_head_k;
+            r.get_u32(
+                format!("{}{}", model_name, LLM_KV_ROPE_DIMENSION_COUNT).as_str(),
+                &mut n_rot,
+                false,
+            );
+            if model_name == "llama" {
+                if n_rot != n_embd_head_k {
+                    panic!("invalid n_rot: {}, expected {}", n_rot, n_embd_head_k)
+                }
+            }
+
+            println!("arch:{}", model_name);
+            println!("n_vocab:{}", n_vocab);
+            println!("n_ctx_train:{}", n_ctx_train);
+            println!("n_embd:{}", n_embd);
+            println!("n_ff:{}", n_ff);
+            println!("n_head:{}", n_head);
+            println!("n_layer:{}", n_layer);
+            println!("n_head_kv:{}", n_head_kv);
+            println!("rope_freq_base_train:{}", rope_freq_base_train);
+            println!("rope_freq_scale_train:{}", rope_freq_scale_train);
+            println!("ropescale:{}", ropescale);
+            println!("n_rot:{}", n_rot);
+            println!("n_head_arr:{:?}", n_head_arr);
+            println!("n_embd_head_k:{:?}", n_embd_head_k);
+            println!("n_embd_head_v:{:?}", n_embd_head_v);
+
+            println!("n_expert:{}", n_expert);
+
+            Ok(Self {
+                architecture: ModelArchitecture::decode(model_name)?,
+                model_name: model_name.to_string(),
+                vocab_only: false,
+                n_vocab: n_vocab as u32,
+                n_ctx_train: n_ctx_train, // context size the model was trained on
+                n_head: n_head,
+                n_embd: n_embd,
+                n_head_kv: n_head_kv,
+                n_layer: n_layer,
+                n_rot: n_rot,
+                n_ff: n_ff,
+                f_norm_eps: 0.0e+00,
+                f_norm_rms_eps: 1.0e-05,
+                rope_freq_base_train: rope_freq_base_train,
+                rope_freq_scale_train: rope_freq_scale_train,
+                n_embd_head_k: n_embd_head_k,
+                n_embd_head_v: n_embd_head_v,
+                n_expert: n_expert,
+                n_head_arr: n_head_arr,
+            })
+        } else {
+            todo!()
+        }
     }
 
     pub(crate) fn n_gqa(&self) -> u32 {
@@ -345,6 +559,14 @@ impl LlamaHparams {
 
     pub(crate) fn n_embd_head(&self) -> u32 {
         self.n_embd / self.n_head
+    }
+
+    pub(crate) fn n_head(&self, il: usize) -> u32 {
+        if il < self.n_layer as usize {
+            return self.n_head_arr[il];
+        }
+        assert!(false);
+        return 0;
     }
 }
 
@@ -379,13 +601,16 @@ impl LlamaKvCell {
     }
 }
 
-pub(crate) struct LlamaBatch {
-    pub(crate) token: Vec<LlamaToken>,
+pub(crate) struct LlamaBatch<'a> {
+    pub(crate) token: &'a [LlamaToken],
     pub(crate) pos: Vec<LlamaPos>,
     pub(crate) seq_id: Vec<LlamaSeqId>,
+    // all_pos_0: i32,
+    // all_pos_1: i32,
+    // all_seq_id: i32,
 }
 
-impl LlamaBatch {
+impl<'a> LlamaBatch<'a> {
     pub(crate) fn n_token(&self) -> usize {
         self.token.len()
     }
@@ -744,10 +969,40 @@ impl GGufMetadataValue {
         }
     }
 
-    fn get_i32_arr(&self) -> Option<&[i32]> {
+    fn get_u32_arr(&self) -> Option<&[u32]> {
         match self {
             GGufMetadataValue::Array(e) => match e {
-                GGufArr::I32Array(arr) => Some(arr.as_slice()),
+                GGufArr::U32Array(arr) => Some(arr.as_slice()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn get_key_or_arr_u32(&self, res: &mut [u32]) {
+        match self {
+            GGufMetadataValue::Array(e) => match e {
+                GGufArr::U32Array(arr) => {
+                    let a = arr.as_slice();
+                    for i in 0..res.len() {
+                        res[i] = a[i];
+                    }
+                }
+                _ => {}
+            },
+            GGufMetadataValue::U32(e) => {
+                for i in 0..res.len() {
+                    res[i] = *e;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn get_i32_arr(&self) -> Option<Vec<i32>> {
+        match self {
+            GGufMetadataValue::Array(e) => match e {
+                GGufArr::I32Array(arr) => Some(arr.to_vec()),
                 _ => None,
             },
             _ => None,
@@ -925,6 +1180,48 @@ pub(crate) struct GGufContext {
 impl GGufContext {
     fn metas_data(&self) -> &HashMap<GGufStr, GGufMetadataValue> {
         &self.metas
+    }
+
+    fn get_arr_f32<'a>(&'a self, k: &str, result: &mut Option<Vec<f32>>, required: bool) {
+        match self.metas_data().get(k) {
+            Some(v) => {
+                let u = v.get_f32_arr().unwrap();
+                *result = Some(u);
+            }
+            None => {
+                if required {
+                    panic!("required key:{}", k);
+                }
+            }
+        }
+    }
+
+    fn get_arr_i32<'a>(&'a self, k: &str, result: &mut Option<Vec<i32>>, required: bool) {
+        match self.metas_data().get(k) {
+            Some(v) => {
+                let u = v.get_i32_arr().unwrap();
+                *result = Some(u);
+            }
+            None => {
+                if required {
+                    panic!("required key:{}", k);
+                }
+            }
+        }
+    }
+
+    fn get_u32(&self, k: &str, result: &mut u32, required: bool) {
+        match self.metas_data().get(k) {
+            Some(v) => {
+                let u = v.get_u32().unwrap();
+                *result = u;
+            }
+            None => {
+                if required {
+                    panic!("required key:{}", k);
+                }
+            }
+        }
     }
 }
 

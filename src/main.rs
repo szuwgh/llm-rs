@@ -1,6 +1,9 @@
+#![feature(core_intrinsics)]
 mod common;
+mod sample;
 mod tokenizer;
 mod unicode;
+mod unicode_data;
 use crate::common::BinarySerialize;
 use crate::common::GGufRead;
 use crate::common::LLMError;
@@ -14,8 +17,7 @@ use crate::meta::LLamaVocab;
 use crate::meta::LlamaBatch;
 use crate::meta::LlamaHparams;
 use crate::meta::LlamaKvCache;
-use crate::tokenizer::replace_all;
-use crate::tokenizer::LLMtokenizerSpm;
+use crate::meta::LlamaToken;
 use byteorder::LittleEndian;
 use byteorder::ReadBytesExt;
 use galois::cuda::CudaDevice;
@@ -26,7 +28,10 @@ use galois::Device;
 use galois::TensorProto;
 use galois::TensorView;
 use memmap2::Mmap;
+use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::io;
+use std::io::Write;
 use tokenizer::tokenize;
 mod meta;
 use std::f32::INFINITY;
@@ -107,8 +112,10 @@ fn create_tensor<'a, const N: usize, T: TensorProto>(
     name: &str,
     ne: [usize; N],
     dev: &Device,
-) -> LLMResult<T> {
-    let tensor_info = tensor_infos.get(name).unwrap();
+) -> LLMResult<Option<T>> {
+    let tensor_info = tensor_infos.get(name).unwrap_or_else(|| {
+        panic!("Error: Tensor info for '{}' not found", name);
+    });
     let dtype = tensor_info.typ;
     let cur_offset = tensor_info.offset as usize;
     let mut size_needed: usize = get_type_size(dtype) * (ne[0] / get_blck_size(dtype));
@@ -123,11 +130,12 @@ fn create_tensor<'a, const N: usize, T: TensorProto>(
     }
     assert!(size_needed == tensor_info.size as usize);
     println!(
-        "name:{},cur_offset:{},size_needed:{},get_type_sizef(dtype):{}",
+        "name:{},cur_offset:{},size_needed:{},get_type_sizef(dtype):{},dtype:{:?}",
         name,
         cur_offset,
         size_needed,
-        get_type_sizef(dtype) as usize
+        get_type_sizef(dtype) as usize,
+        dtype.typ_name(),
     );
     if cur_offset + size_needed > buf.len() {
         return Err(LLMError::NotEnoughSpace);
@@ -141,7 +149,7 @@ fn create_tensor<'a, const N: usize, T: TensorProto>(
             dev,
         )
     }?;
-    Ok(t)
+    Ok(Some(t))
 }
 
 fn new_tensor_1d<'a>(
@@ -652,9 +660,9 @@ struct LlamaModel<'a> {
 
     output: TensorView<'a>,
 
-    gpu_layers: Vec<CudaLayer>,
+    gpu_layers: Vec<TensorLayer<Tensor>>,
 
-    cpu_layers: Vec<CpuLayer<'a>>,
+    cpu_layers: Vec<TensorLayer<TensorView<'a>>>,
     // key + value memory
     // memory_k: Tensor,
     // memory_v: Tensor,
@@ -663,42 +671,37 @@ struct LlamaModel<'a> {
     // std::map<std::string, struct ggml_tensor *> tensors;
 }
 
-struct CudaLayer {
-    // normalization
-    attention_norm: Tensor,
+struct TensorLayer<T: TensorProto> {
+    attention_norm: T,
 
     // attention
-    wq: Tensor,
-    wk: Tensor,
-    wv: Tensor,
-    wo: Tensor,
+    wq: T,
+    wk: T,
+    wv: T,
+    wo: T,
 
     // normalization
-    ffn_norm: Tensor,
+    ffn_norm: T,
 
     // ff
-    w1: Tensor,
-    w2: Tensor,
-    w3: Tensor,
-}
+    // w1: T,
+    // w2: T,
+    // w3: T,
 
-struct CpuLayer<'a> {
-    // normalization
-    attention_norm: TensorView<'a>,
-
-    // attention
-    wq: TensorView<'a>,
-    wk: TensorView<'a>,
-    wv: TensorView<'a>,
-    wo: TensorView<'a>,
-
-    // normalization
-    ffn_norm: TensorView<'a>,
+    // attention bias
+    bq: Option<T>,
+    bk: Option<T>,
+    bv: Option<T>,
+    bo: Option<T>,
 
     // ff
-    w1: TensorView<'a>,
-    w2: TensorView<'a>,
-    w3: TensorView<'a>,
+    ffn_gate: T, // w1
+    ffn_down: T, // w2
+    ffn_up: T,   // w3
+
+    ffn_gate_b: Option<T>,
+    ffn_down_b: Option<T>, // b2
+    ffn_up_b: Option<T>,   // b3
 }
 
 // impl Default for LlamaHparams {
@@ -812,6 +815,206 @@ impl Read for GGufMmapReader {
 impl<'a> LlamaModel<'a> {
     // fn eval(llama_batch: Vec<LLamaToken>) {}
 
+    fn load_layer<T: TensorProto>(
+        tensor_data: &'a [u8],
+        tensor_infos: &HashMap<GGufStr, GGufDiskTensorInfo>,
+        hparams: &LlamaHparams,
+        n_layer: usize,
+        dev: &Device,
+    ) -> LLMResult<Vec<TensorLayer<T>>> {
+        let n_embd = hparams.n_embd as usize;
+        let n_embd_gqa = hparams.n_embd_gqa() as usize;
+        // let n_layer = hparams.n_layer as usize;
+        let n_vocab = hparams.n_vocab as usize;
+        let n_ff = hparams.n_ff as usize;
+        let n_expert = hparams.n_expert;
+        let n_head = hparams.n_head(0) as usize;
+        let n_embd_head_k = hparams.n_embd_head_k as usize;
+        let n_rot = hparams.n_rot as usize;
+
+        let mut layers = Vec::new();
+        for i in 0..n_layer {
+            let attention_norm: T = create_tensor(
+                tensor_data,
+                &tensor_infos,
+                &format!("blk.{}.attn_norm.weight", i),
+                [n_embd],
+                dev,
+            )?
+            .unwrap();
+
+            let wq: T = create_tensor(
+                tensor_data,
+                &tensor_infos,
+                &format!("blk.{}.attn_q.weight", i),
+                [n_embd, n_embd_head_k * n_head],
+                dev,
+            )?
+            .unwrap();
+
+            let wk: T = create_tensor(
+                tensor_data,
+                &tensor_infos,
+                &format!("blk.{}.attn_k.weight", i),
+                [n_embd, n_embd_gqa],
+                dev,
+            )?
+            .unwrap();
+
+            let wv: T = create_tensor(
+                tensor_data,
+                &tensor_infos,
+                &format!("blk.{}.attn_v.weight", i),
+                [n_embd, n_embd_gqa],
+                dev,
+            )?
+            .unwrap();
+
+            let wo: T = create_tensor(
+                tensor_data,
+                &tensor_infos,
+                &format!("blk.{}.attn_output.weight", i),
+                [n_embd_head_k * n_head, n_embd],
+                dev,
+            )?
+            .unwrap();
+
+            let bq = None;
+            let bk = None;
+            let bv = None;
+            let bo = None;
+
+            // let bq: T = create_tensor(
+            //     tensor_data,
+            //     &tensor_infos,
+            //     &format!("blk.{}.attn_q.bias", i),
+            //     [n_embd],
+            //     dev,
+            // )?;
+
+            // let bk = create_tensor(
+            //     tensor_data,
+            //     &tensor_infos,
+            //     &format!("blk.{}.attn_k.bias", i),
+            //     [n_embd_gqa],
+            //     dev,
+            // )?;
+
+            // let bv = create_tensor(
+            //     tensor_data,
+            //     &tensor_infos,
+            //     "blk.{}.attn_v.bias",
+            //     [n_embd_gqa],
+            //     dev,
+            // )?;
+
+            // let bo = create_tensor(
+            //     tensor_data,
+            //     &tensor_infos,
+            //     "blk.%d.attn_output.bias",
+            //     [n_embd],
+            //     dev,
+            // )?;
+
+            let ffn_norm: T = create_tensor(
+                tensor_data,
+                &tensor_infos,
+                &format!("blk.{}.ffn_norm.weight", i),
+                [n_embd],
+                dev,
+            )?
+            .unwrap();
+
+            let rope_freqs: T = create_tensor(
+                tensor_data,
+                &tensor_infos,
+                "rope_freqs.weight",
+                [n_rot / 2],
+                dev,
+            )?
+            .unwrap();
+
+            if n_expert == 0 {
+                let ffn_gate: T = create_tensor(
+                    tensor_data,
+                    &tensor_infos,
+                    &format!("blk.{}.ffn_gate.weight", i),
+                    [n_embd, n_ff],
+                    dev,
+                )?
+                .unwrap();
+                let ffn_down = create_tensor(
+                    tensor_data,
+                    &tensor_infos,
+                    &format!("blk.{}.ffn_down.weight", i),
+                    [n_ff, n_embd],
+                    dev,
+                )?
+                .unwrap();
+                let ffn_up = create_tensor(
+                    tensor_data,
+                    &tensor_infos,
+                    &format!("blk.{}.ffn_up.weight", i),
+                    [n_embd, n_ff],
+                    dev,
+                )?
+                .unwrap();
+
+                // optional MLP bias
+                let ffn_gate_b = None;
+                // let ffn_gate_b = create_tensor(
+                //     tensor_data,
+                //     &tensor_infos,
+                //     &format!("blk.{}.ffn_up.bias", i),
+                //     [n_ff],
+                //     dev,
+                // )?
+                // .unwrap();
+                let ffn_down_b = None;
+                // let ffn_down_b = create_tensor(
+                //     tensor_data,
+                //     &tensor_infos,
+                //     &format!("blk.{}.ffn_down.bias", i),
+                //     [n_embd],
+                //     dev,
+                // )?;
+                let ffn_up_b = None;
+                // let ffn_up_b = create_tensor(
+                //     tensor_data,
+                //     &tensor_infos,
+                //     &format!("blk.{}.ffn_up.bias", i),
+                //     [n_ff],
+                //     dev,
+                // )?;
+
+                layers.push(TensorLayer {
+                    attention_norm,
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    ffn_norm,
+
+                    bq,
+                    bk,
+                    bv,
+                    bo,
+
+                    ffn_gate,
+                    ffn_down,
+                    ffn_up,
+
+                    ffn_gate_b,
+                    ffn_down_b,
+                    ffn_up_b,
+                });
+            } else {
+                todo!()
+            }
+        }
+        Ok(layers)
+    }
+
     fn load<T: Read + GGufRead>(
         gguf_reader: &'a mut T,
         hparams: LlamaHparams,
@@ -840,14 +1043,17 @@ impl<'a> LlamaModel<'a> {
             "token_embd.weight",
             [n_embd, n_vocab],
             &cpu_dev,
-        )?;
+        )?
+        .unwrap();
+
         let output_norm: TensorView<'a> = create_tensor(
             &tensor_data,
             &tensor_infos,
             "output_norm.weight",
             [n_embd],
             &cpu_dev,
-        )?;
+        )?
+        .unwrap();
 
         let output: TensorView<'a> = create_tensor(
             &tensor_data,
@@ -855,174 +1061,184 @@ impl<'a> LlamaModel<'a> {
             "output.weight",
             [n_embd, n_vocab],
             &cpu_dev,
-        )?;
+        )?
+        .unwrap();
         // let output = create_tensor(&mut tensor_ctx, "output.weight", [n_embd, n_vocab])?;
         // let output_norm = create_tensor(&mut tensor_ctx, "output_norm.weight", [n_embd]);
 
-        let mut gpu_layers = Vec::new();
+        let gpu_layers =
+            Self::load_layer(tensor_data, &tensor_infos, &hparams, n_gpu_layer, gpu_dev)?;
+        let cpu_layers = Self::load_layer(
+            tensor_data,
+            &tensor_infos,
+            &hparams,
+            n_layer - n_gpu_layer,
+            &Device::Cpu,
+        )?;
+        // let mut gpu_layers = Vec::new();
 
-        for i in 0..n_gpu_layer {
-            let attention_norm: Tensor = create_tensor(
-                &tensor_data,
-                &tensor_infos,
-                &format!("blk.{}.attn_norm.weight", i),
-                [n_embd],
-                gpu_dev,
-            )?;
+        // for i in 0..n_gpu_layer {
+        //     let attention_norm: Tensor = create_tensor(
+        //         &tensor_data,
+        //         &tensor_infos,
+        //         &format!("blk.{}.attn_norm.weight", i),
+        //         [n_embd],
+        //         gpu_dev,
+        //     )?;
 
-            let wq: Tensor = create_tensor(
-                &tensor_data,
-                &tensor_infos,
-                &format!("blk.{}.attn_q.weight", i),
-                [n_embd, n_embd],
-                gpu_dev,
-            )?;
-            let wk: Tensor = create_tensor(
-                &tensor_data,
-                &tensor_infos,
-                &format!("blk.{}.attn_k.weight", i),
-                [n_embd, n_embd_gqa],
-                gpu_dev,
-            )?;
-            let wv: Tensor = create_tensor(
-                &tensor_data,
-                &tensor_infos,
-                &format!("blk.{}.attn_v.weight", i),
-                [n_embd, n_embd_gqa],
-                gpu_dev,
-            )?;
-            let wo: Tensor = create_tensor(
-                &tensor_data,
-                &tensor_infos,
-                &format!("blk.{}.attn_output.weight", i),
-                [n_embd, n_embd],
-                gpu_dev,
-            )?;
+        //     let wq: Tensor = create_tensor(
+        //         &tensor_data,
+        //         &tensor_infos,
+        //         &format!("blk.{}.attn_q.weight", i),
+        //         [n_embd, n_embd],
+        //         gpu_dev,
+        //     )?;
+        //     let wk: Tensor = create_tensor(
+        //         &tensor_data,
+        //         &tensor_infos,
+        //         &format!("blk.{}.attn_k.weight", i),
+        //         [n_embd, n_embd_gqa],
+        //         gpu_dev,
+        //     )?;
+        //     let wv: Tensor = create_tensor(
+        //         &tensor_data,
+        //         &tensor_infos,
+        //         &format!("blk.{}.attn_v.weight", i),
+        //         [n_embd, n_embd_gqa],
+        //         gpu_dev,
+        //     )?;
+        //     let wo: Tensor = create_tensor(
+        //         &tensor_data,
+        //         &tensor_infos,
+        //         &format!("blk.{}.attn_output.weight", i),
+        //         [n_embd, n_embd],
+        //         gpu_dev,
+        //     )?;
 
-            let ffn_norm: Tensor = create_tensor(
-                &tensor_data,
-                &tensor_infos,
-                &format!("blk.{}.ffn_norm.weight", i),
-                [n_embd],
-                gpu_dev,
-            )?;
+        //     let ffn_norm: Tensor = create_tensor(
+        //         &tensor_data,
+        //         &tensor_infos,
+        //         &format!("blk.{}.ffn_norm.weight", i),
+        //         [n_embd],
+        //         gpu_dev,
+        //     )?;
 
-            let w1: Tensor = create_tensor(
-                &tensor_data,
-                &tensor_infos,
-                &format!("blk.{}.ffn_gate.weight", i),
-                [n_embd, n_ff],
-                gpu_dev,
-            )?;
-            let w2: Tensor = create_tensor(
-                &tensor_data,
-                &tensor_infos,
-                &format!("blk.{}.ffn_down.weight", i),
-                [n_ff, n_embd],
-                gpu_dev,
-            )?;
-            let w3: Tensor = create_tensor(
-                &tensor_data,
-                &tensor_infos,
-                &format!("blk.{}.ffn_up.weight", i),
-                [n_embd, n_ff],
-                gpu_dev,
-            )?;
+        //     let w1: Tensor = create_tensor(
+        //         &tensor_data,
+        //         &tensor_infos,
+        //         &format!("blk.{}.ffn_gate.weight", i),
+        //         [n_embd, n_ff],
+        //         gpu_dev,
+        //     )?;
+        //     let w2: Tensor = create_tensor(
+        //         &tensor_data,
+        //         &tensor_infos,
+        //         &format!("blk.{}.ffn_down.weight", i),
+        //         [n_ff, n_embd],
+        //         gpu_dev,
+        //     )?;
+        //     let w3: Tensor = create_tensor(
+        //         &tensor_data,
+        //         &tensor_infos,
+        //         &format!("blk.{}.ffn_up.weight", i),
+        //         [n_embd, n_ff],
+        //         gpu_dev,
+        //     )?;
 
-            gpu_layers.push(CudaLayer {
-                attention_norm,
-                wq,
-                wk,
-                wv,
-                wo,
-                ffn_norm,
-                w1,
-                w2,
-                w3,
-            });
-        }
+        //     gpu_layers.push(TensorLayer {
+        //         attention_norm,
+        //         wq,
+        //         wk,
+        //         wv,
+        //         wo,
+        //         ffn_norm,
+        //         w1,
+        //         w2,
+        //         w3,
+        //     });
+        // }
 
-        let mut cpu_layers = Vec::new();
-        for i in 0..n_layer - n_gpu_layer {
-            let attention_norm: TensorView<'a> = create_tensor(
-                &tensor_data,
-                &tensor_infos,
-                &format!("blk.{}.attn_norm.weight", i),
-                [n_embd],
-                &cpu_dev,
-            )?;
+        // let mut cpu_layers = Vec::new();
+        // for i in 0..n_layer - n_gpu_layer {
+        //     let attention_norm: TensorView<'a> = create_tensor(
+        //         &tensor_data,
+        //         &tensor_infos,
+        //         &format!("blk.{}.attn_norm.weight", i),
+        //         [n_embd],
+        //         &cpu_dev,
+        //     )?;
 
-            let wq: TensorView<'a> = create_tensor(
-                &tensor_data,
-                &tensor_infos,
-                &format!("blk.{}.attn_q.weight", i),
-                [n_embd, n_embd],
-                &cpu_dev,
-            )?;
-            let wk: TensorView<'a> = create_tensor(
-                &tensor_data,
-                &tensor_infos,
-                &format!("blk.{}.attn_k.weight", i),
-                [n_embd, n_embd_gqa],
-                &cpu_dev,
-            )?;
-            let wv: TensorView<'a> = create_tensor(
-                &tensor_data,
-                &tensor_infos,
-                &format!("blk.{}.attn_v.weight", i),
-                [n_embd, n_embd_gqa],
-                &cpu_dev,
-            )?;
-            let wo: TensorView<'a> = create_tensor(
-                &tensor_data,
-                &tensor_infos,
-                &format!("blk.{}.attn_output.weight", i),
-                [n_embd, n_embd],
-                &cpu_dev,
-            )?;
+        //     let wq: TensorView<'a> = create_tensor(
+        //         &tensor_data,
+        //         &tensor_infos,
+        //         &format!("blk.{}.attn_q.weight", i),
+        //         [n_embd, n_embd],
+        //         &cpu_dev,
+        //     )?;
+        //     let wk: TensorView<'a> = create_tensor(
+        //         &tensor_data,
+        //         &tensor_infos,
+        //         &format!("blk.{}.attn_k.weight", i),
+        //         [n_embd, n_embd_gqa],
+        //         &cpu_dev,
+        //     )?;
+        //     let wv: TensorView<'a> = create_tensor(
+        //         &tensor_data,
+        //         &tensor_infos,
+        //         &format!("blk.{}.attn_v.weight", i),
+        //         [n_embd, n_embd_gqa],
+        //         &cpu_dev,
+        //     )?;
+        //     let wo: TensorView<'a> = create_tensor(
+        //         &tensor_data,
+        //         &tensor_infos,
+        //         &format!("blk.{}.attn_output.weight", i),
+        //         [n_embd, n_embd],
+        //         &cpu_dev,
+        //     )?;
 
-            let ffn_norm: TensorView<'a> = create_tensor(
-                &tensor_data,
-                &tensor_infos,
-                &format!("blk.{}.ffn_norm.weight", i),
-                [n_embd],
-                &cpu_dev,
-            )?;
+        //     let ffn_norm: TensorView<'a> = create_tensor(
+        //         &tensor_data,
+        //         &tensor_infos,
+        //         &format!("blk.{}.ffn_norm.weight", i),
+        //         [n_embd],
+        //         &cpu_dev,
+        //     )?;
 
-            let w1: TensorView<'a> = create_tensor(
-                &tensor_data,
-                &tensor_infos,
-                &format!("blk.{}.ffn_gate.weight", i),
-                [n_embd, n_ff],
-                &cpu_dev,
-            )?;
-            let w2: TensorView<'a> = create_tensor(
-                &tensor_data,
-                &tensor_infos,
-                &format!("blk.{}.ffn_down.weight", i),
-                [n_ff, n_embd],
-                &cpu_dev,
-            )?;
-            let w3: TensorView<'a> = create_tensor(
-                &tensor_data,
-                &tensor_infos,
-                &format!("blk.{}.ffn_up.weight", i),
-                [n_embd, n_ff],
-                &cpu_dev,
-            )?;
+        //     let w1: TensorView<'a> = create_tensor(
+        //         &tensor_data,
+        //         &tensor_infos,
+        //         &format!("blk.{}.ffn_gate.weight", i),
+        //         [n_embd, n_ff],
+        //         &cpu_dev,
+        //     )?;
+        //     let w2: TensorView<'a> = create_tensor(
+        //         &tensor_data,
+        //         &tensor_infos,
+        //         &format!("blk.{}.ffn_down.weight", i),
+        //         [n_ff, n_embd],
+        //         &cpu_dev,
+        //     )?;
+        //     let w3: TensorView<'a> = create_tensor(
+        //         &tensor_data,
+        //         &tensor_infos,
+        //         &format!("blk.{}.ffn_up.weight", i),
+        //         [n_embd, n_ff],
+        //         &cpu_dev,
+        //     )?;
 
-            cpu_layers.push(CpuLayer {
-                attention_norm,
-                wq,
-                wk,
-                wv,
-                wo,
-                ffn_norm,
-                w1,
-                w2,
-                w3,
-            });
-        }
+        //     cpu_layers.push(TensorLayer {
+        //         attention_norm,
+        //         wq,
+        //         wk,
+        //         wv,
+        //         wo,
+        //         ffn_norm,
+        //         w1,
+        //         w2,
+        //         w3,
+        //     });
+        // }
         // let x = unsafe { tok_embeddings.as_slice::<BlockQ4_0>() };
         // let mut sum: f64 = 0.0;
         // for i in 0..x.tok_embeddings() {
@@ -1420,15 +1636,19 @@ const MAX_TOKEN_LEN: usize = 18;
 //     return res;
 // }
 
-fn llama_eval<'a>(
+fn llama_eval2<'a>(
     model: &LlamaModel,
     batch: &LlamaBatch,
     kv_self: &LlamaKvCache,
     mem_per_token: usize,
     gpu_dev: &Device,
     n_gpu_layer: usize,
+    logits: &mut Vec<f32>,
 ) -> LLMResult<()> {
     let embd_inp = batch.embd_inp();
+
+    let N = embd_inp.len();
+
     let n_tokens = embd_inp.len();
     let hparams = &model.hparams;
 
@@ -1458,7 +1678,78 @@ fn llama_eval<'a>(
     let buf: Vec<u8> = vec![0u8; buf_size];
     let mut tensor_ctx = TensorContext::new();
 
-    // let mut buf_kv: Vec<u8> = vec![0u8; 10 * 1024 * 1024];
+    let mut buf_kv: Vec<u8> = vec![0u8; 10 * 1024 * 1024];
+    //let mut kv_buf_ctx = TensorContext::new(&mut buf_kv);
+
+    let memory_k = new_tensor_1d(
+        &mut tensor_ctx,
+        &buf,
+        GGmlType::F16,
+        n_elements,
+        &Device::Cpu,
+    )?;
+    let memory_v = new_tensor_1d(
+        &mut tensor_ctx,
+        &buf,
+        GGmlType::F16,
+        n_elements,
+        &Device::Cpu,
+    )?;
+
+    let mut embd = new_tensor_1d(&mut tensor_ctx, &buf, GGmlType::I32, n_tokens, &Device::Cpu)?;
+
+    unsafe {
+        embd.as_slice_mut::<i32>().copy_from_slice(embd_inp);
+    }
+
+    let mut inp_l = get_rows(&mut tensor_ctx, &buf, &model.tok_embeddings, &embd)?;
+
+    Ok(())
+}
+
+fn llama_eval<'a>(
+    model: &LlamaModel,
+    batch: &LlamaBatch,
+    kv_self: &LlamaKvCache,
+    mem_per_token: usize,
+    gpu_dev: &Device,
+    n_gpu_layer: usize,
+    logits: &mut Vec<f32>,
+) -> LLMResult<()> {
+    let embd_inp = batch.embd_inp();
+
+    let N = embd_inp.len();
+
+    let n_tokens = embd_inp.len();
+    let hparams = &model.hparams;
+
+    let n_embd = hparams.n_embd as usize;
+    let n_layer = hparams.n_layer as usize;
+    let n_head = hparams.n_head as usize;
+    let n_head_kv = hparams.n_head_kv as usize;
+    let n_vocab = hparams.n_vocab as usize;
+    let n_rot = (hparams.n_embd / hparams.n_head) as usize;
+    let d_key = (n_embd / n_head) as usize;
+    let n_embd_head = hparams.n_embd_head() as usize;
+    let n_embd_gqa = hparams.n_embd_gqa() as usize;
+    let norm_rms_eps = hparams.f_norm_rms_eps;
+    assert!(n_embd_head == hparams.n_rot as usize);
+    let freq_base = 10000.0;
+    let freq_scale = 1.0;
+
+    let n_embd = hparams.n_embd_gqa() as usize;
+    let n_layer = hparams.n_layer as usize;
+    let n_ctx = 512usize;
+    let n_mem = n_layer * n_ctx;
+    let n_elements = (n_embd * n_mem) as usize;
+    let kv_head = 0; // head;
+    let n_kv = 32;
+
+    let buf_size = 512 * 1024 * 1024; //30MB
+    let buf: Vec<u8> = vec![0u8; buf_size];
+    let mut tensor_ctx = TensorContext::new();
+
+    let mut buf_kv: Vec<u8> = vec![0u8; 10 * 1024 * 1024];
     // let mut kv_buf_ctx = TensorContext::new(&mut buf_kv);
 
     let memory_k = new_tensor_1d(
@@ -1531,156 +1822,156 @@ fn llama_eval<'a>(
 
     let mut cuda_inp_l = inp_l.to_cuda_tensor(gpu_dev)?;
 
-    for il in 0..n_gpu_layer as usize {
-        let mut cur = rms_norm(&mut tensor_ctx, &buf, &cuda_inp_l, norm_rms_eps)?;
+    // for il in 0..n_gpu_layer as usize {
+    //     let mut cur = rms_norm(&mut tensor_ctx, &buf, &cuda_inp_l, norm_rms_eps)?;
 
-        cur = mul(
-            &mut tensor_ctx,
-            &buf,
-            &cur,
-            &model.gpu_layers[il].attention_norm,
-        )?;
+    //     cur = mul(
+    //         &mut tensor_ctx,
+    //         &buf,
+    //         &cur,
+    //         &model.gpu_layers[il].attention_norm,
+    //     )?;
 
-        let tmpk = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].wk, &cur)?;
+    //     let tmpk = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].wk, &cur)?;
 
-        let cpu_v = tmpk.to_cpu_tensor()?;
+    //     let cpu_v = tmpk.to_cpu_tensor()?;
 
-        let tmpk_reshape_3d = reshape_3d(&tmpk, n_embd_head, n_head_kv, n_tokens)?;
+    //     let tmpk_reshape_3d = reshape_3d(&tmpk, n_embd_head, n_head_kv, n_tokens)?;
 
-        let Kcur = rope_custom(
-            &mut tensor_ctx,
-            &buf,
-            &tmpk_reshape_3d,
-            &cuda_KQ_pos,
-            n_embd_head,
-            0,
-            0,
-            freq_base,
-            freq_scale,
-            0.0f32,
-            false,
-        )?;
+    //     let Kcur = rope_custom(
+    //         &mut tensor_ctx,
+    //         &buf,
+    //         &tmpk_reshape_3d,
+    //         &cuda_KQ_pos,
+    //         n_embd_head,
+    //         0,
+    //         0,
+    //         freq_base,
+    //         freq_scale,
+    //         0.0f32,
+    //         false,
+    //     )?;
 
-        let tmpq = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].wq, &cur)?;
+    //     let tmpq = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].wq, &cur)?;
 
-        let tmpq_reshape_3d = reshape_3d(&tmpq, n_embd_head, n_head, n_tokens)?;
+    //     let tmpq_reshape_3d = reshape_3d(&tmpq, n_embd_head, n_head, n_tokens)?;
 
-        let Qcur = rope_custom(
-            &mut tensor_ctx,
-            &buf,
-            &tmpq_reshape_3d,
-            &cuda_KQ_pos,
-            n_embd_head,
-            0,
-            0,
-            freq_base,
-            freq_scale,
-            0.0f32,
-            false,
-        )?;
+    //     let Qcur = rope_custom(
+    //         &mut tensor_ctx,
+    //         &buf,
+    //         &tmpq_reshape_3d,
+    //         &cuda_KQ_pos,
+    //         n_embd_head,
+    //         0,
+    //         0,
+    //         freq_base,
+    //         freq_scale,
+    //         0.0f32,
+    //         false,
+    //     )?;
 
-        {
-            let tmpv = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].wv, &cur)?;
+    //     {
+    //         let tmpv = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].wv, &cur)?;
 
-            let mut tmpv_reshape_2d = reshape_2d(&tmpv, n_embd_gqa, n_tokens)?;
-            let Vcur = transpose(&mut tmpv_reshape_2d)?;
+    //         let mut tmpv_reshape_2d = reshape_2d(&tmpv, n_embd_gqa, n_tokens)?;
+    //         let Vcur = transpose(&mut tmpv_reshape_2d)?;
 
-            let mut k = view_1d(
-                &cuda_k,
-                n_tokens * n_embd_gqa,
-                (n_embd_gqa) * (il * n_ctx + kv_head), //memory_k.elem_size()
-            )?;
+    //         let mut k = view_1d(
+    //             &cuda_k,
+    //             n_tokens * n_embd_gqa,
+    //             (n_embd_gqa) * (il * n_ctx + kv_head), //memory_k.elem_size()
+    //         )?;
 
-            let mut v = view_2d(
-                &cuda_v,
-                n_tokens,
-                n_embd_gqa,
-                n_ctx,
-                (il * n_ctx) * n_embd_gqa + kv_head, //memory_v.elem_size()
-            )?;
+    //         let mut v = view_2d(
+    //             &cuda_v,
+    //             n_tokens,
+    //             n_embd_gqa,
+    //             n_ctx,
+    //             (il * n_ctx) * n_embd_gqa + kv_head, //memory_v.elem_size()
+    //         )?;
 
-            // important: storing RoPE-ed version of K in the KV cache!
-            cpy(&Kcur, &mut k)?;
-            cpy(&Vcur, &mut v)?;
-        }
+    //         // important: storing RoPE-ed version of K in the KV cache!
+    //         cpy(&Kcur, &mut k)?;
+    //         cpy(&Vcur, &mut v)?;
+    //     }
 
-        let Q = permute(Qcur, 0, 2, 1, 3)?;
+    //     let Q = permute(Qcur, 0, 2, 1, 3)?;
 
-        let K = view_3d(
-            &cuda_k,
-            n_embd_head,
-            n_kv,
-            n_head_kv,
-            n_embd_gqa,
-            n_embd_head,
-            n_embd_gqa * n_ctx * il, //memory_k.elem_size()
-        )?;
+    //     let K = view_3d(
+    //         &cuda_k,
+    //         n_embd_head,
+    //         n_kv,
+    //         n_head_kv,
+    //         n_embd_gqa,
+    //         n_embd_head,
+    //         n_embd_gqa * n_ctx * il, //memory_k.elem_size()
+    //     )?;
 
-        let KQ: Tensor = matmul(&mut tensor_ctx, &buf, &K, &Q)?;
+    //     let KQ: Tensor = matmul(&mut tensor_ctx, &buf, &K, &Q)?;
 
-        let KQ_scaled = scale(&mut tensor_ctx, &buf, &KQ, &KQ_scale)?;
+    //     let KQ_scaled = scale(&mut tensor_ctx, &buf, &KQ, &KQ_scale)?;
 
-        let KQ_masked = add(&mut tensor_ctx, &buf, &KQ_scaled, &cuda_KQ_mask)?;
+    //     let KQ_masked = add(&mut tensor_ctx, &buf, &KQ_scaled, &cuda_KQ_mask)?;
 
-        let KQ_soft_max = soft_max(&mut tensor_ctx, &buf, &KQ_masked)?;
+    //     let KQ_soft_max = soft_max(&mut tensor_ctx, &buf, &KQ_masked)?;
 
-        let V = view_3d(
-            &cuda_v,
-            n_kv,
-            n_embd_head,
-            n_head_kv,
-            n_ctx,
-            n_ctx * n_embd_head,
-            n_ctx * n_embd_gqa * il, //memory_v.elem_size()
-        )?;
-        let KQV = matmul(&mut tensor_ctx, &buf, &V, &KQ_soft_max)?;
+    //     let V = view_3d(
+    //         &cuda_v,
+    //         n_kv,
+    //         n_embd_head,
+    //         n_head_kv,
+    //         n_ctx,
+    //         n_ctx * n_embd_head,
+    //         n_ctx * n_embd_gqa * il, //memory_v.elem_size()
+    //     )?;
+    //     let KQV = matmul(&mut tensor_ctx, &buf, &V, &KQ_soft_max)?;
 
-        let KQV_merged = permute(KQV, 0, 2, 1, 3)?;
+    //     let KQV_merged = permute(KQV, 0, 2, 1, 3)?;
 
-        cur = cont_2d(&mut tensor_ctx, &buf, &KQV_merged, n_embd, n_tokens)?;
+    //     cur = cont_2d(&mut tensor_ctx, &buf, &KQV_merged, n_embd, n_tokens)?;
 
-        cur = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].wo, &cur)?;
-        let inpFF = add(&mut tensor_ctx, &buf, &cur, &cuda_inp_l)?;
+    //     cur = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].wo, &cur)?;
+    //     let inpFF = add(&mut tensor_ctx, &buf, &cur, &cuda_inp_l)?;
 
-        // feed-forward network
-        {
-            {
-                cur = rms_norm(&mut tensor_ctx, &buf, &inpFF, norm_rms_eps)?;
+    //     // feed-forward network
+    //     {
+    //         {
+    //             cur = rms_norm(&mut tensor_ctx, &buf, &inpFF, norm_rms_eps)?;
 
-                cur = mul(&mut tensor_ctx, &buf, &cur, &model.gpu_layers[il].ffn_norm)?;
-            }
+    //             cur = mul(&mut tensor_ctx, &buf, &cur, &model.gpu_layers[il].ffn_norm)?;
+    //         }
 
-            let tmp = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].w3, &cur)?;
-            cur = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].w1, &cur)?;
+    //         let tmp = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].w3, &cur)?;
+    //         cur = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].w1, &cur)?;
 
-            // SILU activation
-            cur = silu(&mut tensor_ctx, &buf, &cur)?;
+    //         // SILU activation
+    //         cur = silu(&mut tensor_ctx, &buf, &cur)?;
 
-            cur = mul(&mut tensor_ctx, &buf, &cur, &tmp)?;
+    //         cur = mul(&mut tensor_ctx, &buf, &cur, &tmp)?;
 
-            cur = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].w2, &cur)?;
-        }
+    //         cur = matmul(&mut tensor_ctx, &buf, &model.gpu_layers[il].w2, &cur)?;
+    //     }
 
-        cur = add(&mut tensor_ctx, &buf, &cur, &inpFF)?;
+    //     cur = add(&mut tensor_ctx, &buf, &cur, &inpFF)?;
 
-        // input for next layer
-        cuda_inp_l = cur;
-    }
+    //     // input for next layer
+    //     cuda_inp_l = cur;
+    // }
 
-    let mut cur = cuda_inp_l;
+    // let mut cur = cuda_inp_l;
 
-    {
-        cur = rms_norm(&mut tensor_ctx, &buf, &cur, norm_rms_eps)?;
+    // {
+    //     cur = rms_norm(&mut tensor_ctx, &buf, &cur, norm_rms_eps)?;
 
-        cur = mul(&mut tensor_ctx, &buf, &cur, &model.output_norm)?;
-    }
+    //     cur = mul(&mut tensor_ctx, &buf, &cur, &model.output_norm)?;
+    // }
 
     // // lm_head
     // cur = matmul(&mut tensor_ctx, &buf, &model.output, &cur)?;
 
     //let mut Qcur: Option<TensorView<'_>> = None;
 
-    for il in 0..1 as usize {
+    for il in 0..n_layer as usize {
         //let inpSA = &inp_l;
         let mut cur = rms_norm(&mut tensor_ctx, &buf, &inp_l, norm_rms_eps)?;
 
@@ -1726,7 +2017,7 @@ fn llama_eval<'a>(
             0.0f32,
             false,
         )?;
-        println!("{} ,stride:{:?}", "Qcur", Qcur.dim().stride_4d());
+        //println!("{} ,stride:{:?}", "Qcur", Qcur.dim().stride_4d());
         // store key and value to memory
         {
             let tmpv = matmul(&mut tensor_ctx, &buf, &model.cpu_layers[il].wv, &cur)?;
@@ -1764,16 +2055,16 @@ fn llama_eval<'a>(
                 n_embd_head,
                 n_embd_gqa * n_ctx * il, //memory_k.elem_size()
             )?;
-            println!(
-                "cpu K,shape:{:?} ,stride:{:?}",
-                K.dim().shape_layout(),
-                K.dim().stride_4d()
-            );
-            println!(
-                "cpu Q,shape:{:?} ,stride:{:?}",
-                Q.dim().shape_layout(),
-                Q.dim().stride_4d()
-            );
+            // println!(
+            //     "cpu K,shape:{:?} ,stride:{:?}",
+            //     K.dim().shape_layout(),
+            //     K.dim().stride_4d()
+            // );
+            // println!(
+            //     "cpu Q,shape:{:?} ,stride:{:?}",
+            //     Q.dim().shape_layout(),
+            //     Q.dim().stride_4d()
+            // );
 
             let KQ = matmul(&mut tensor_ctx, &buf, &K, &Q)?;
 
@@ -1810,33 +2101,37 @@ fn llama_eval<'a>(
                     cur = mul(&mut tensor_ctx, &buf, &cur, &model.cpu_layers[il].ffn_norm)?;
                 }
 
-                let tmp = matmul(&mut tensor_ctx, &buf, &model.cpu_layers[il].w3, &cur)?;
-                cur = matmul(&mut tensor_ctx, &buf, &model.cpu_layers[il].w1, &cur)?;
+                // ffn_gate: T, // w1
+                // ffn_down: T, // w2
+                // ffn_up: T,   // w3
+
+                let tmp = matmul(&mut tensor_ctx, &buf, &model.cpu_layers[il].ffn_up, &cur)?;
+                cur = matmul(&mut tensor_ctx, &buf, &model.cpu_layers[il].ffn_gate, &cur)?;
 
                 // SILU activation
                 cur = silu(&mut tensor_ctx, &buf, &cur)?;
 
                 cur = mul(&mut tensor_ctx, &buf, &cur, &tmp)?;
 
-                cur = matmul(&mut tensor_ctx, &buf, &model.cpu_layers[il].w2, &cur)?;
+                cur = matmul(&mut tensor_ctx, &buf, &model.cpu_layers[il].ffn_down, &cur)?;
             }
 
             cur = add(&mut tensor_ctx, &buf, &cur, &inpFF)?;
         }
 
-        let x: &[f32] = unsafe { cur.as_slice::<f32>() };
-        let mut sum: f32 = 0.0;
-        for i in 0..cur.elem_count() {
-            sum += x[i];
-        }
-        println!(
-            "{} cpu cur,sum:{:?},shape:{:?},stride:{:?}",
-            "KQ",
-            sum,
-            cur.shape_layout(),
-            cur.dim().stride_4d()
-        );
-        return Ok(());
+        // let x: &[f32] = unsafe { cur.as_slice::<f32>() };
+        // let mut sum: f32 = 0.0;
+        // for i in 0..cur.elem_count() {
+        //     sum += x[i];
+        // }
+        // println!(
+        //     "{} cpu cur,sum:{:?},shape:{:?},stride:{:?}",
+        //     "KQ",
+        //     sum,
+        //     cur.shape_layout(),
+        //     cur.dim().stride_4d()
+        // );
+        // return Ok(());
 
         inp_l = cur;
         // input for next layer
@@ -1853,17 +2148,30 @@ fn llama_eval<'a>(
     // lm_head
     cur = matmul(&mut tensor_ctx, &buf, &model.output, &cur)?;
 
-    let x: &[f32] = unsafe { cur.as_slice::<f32>() };
-    let mut sum: f32 = 0.0;
-    for i in 0..cur.elem_count() {
-        sum += x[i];
+    // let x: &[f32] = unsafe { cur.as_slice::<f32>() };
+    // let mut sum: f32 = 0.0;
+    // for i in 0..cur.elem_count() {
+    //     sum += x[i];
+    // }
+    // println!(
+    //     "cur,sum:{:?},shape:{:?},stride:{:?}",
+    //     sum,
+    //     cur.shape_layout(),
+    //     cur.dim().stride_4d()
+    // );
+
+    logits.resize(n_vocab, 0.0);
+    // memcpy(embd_w.data(), (float *) ggml_get_data(inpL) + (n_vocab*(N-1)), sizeof(float)*n_vocab);
+
+    unsafe {
+        // 计算偏移量，找到最新的 token 的 logits
+        let inp_l = cur.as_slice::<f32>();
+        logits.copy_from_slice(&inp_l[n_vocab * (N - 1)..n_vocab * (N - 1) + n_vocab]);
+
+        // 从 `inpL` 复制 `n_vocab` 个 float 到 `embd_w`
+        //let logits_slice = slice::from_raw_parts(logits_ptr, n_vocab);
     }
-    println!(
-        "cur,sum:{:?},shape:{:?},stride:{:?}",
-        sum,
-        cur.shape_layout(),
-        cur.dim().stride_4d()
-    );
+
     return Ok(());
 
     Ok(())
@@ -1933,8 +2241,101 @@ impl GGufDiskTensorInfo {
     }
 }
 
+fn sample_top_k(logits_id: &mut Vec<(f64, i32)>, top_k: usize) {
+    if top_k == 0 || logits_id.is_empty() {
+        return;
+    }
+    let k = top_k.min(logits_id.len());
+    logits_id.select_nth_unstable_by(k, |a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+
+    // 仅保留前 `top_k` 个元素
+    logits_id.truncate(top_k);
+}
+
+use rand::distr::weighted::WeightedIndex;
+use rand::prelude::*;
+
+fn llama_sample_top_p_top_k(
+    vocab: &LLamaVocab,
+    logits: &mut [f32],
+    last_n_tokens: &[i32],
+    repeat_penalty: f64,
+    top_k: usize,
+    top_p: f64,
+    temp: f64,
+    rng: &mut impl Rng, // 可变随机数生成器
+) -> i32 {
+    let n_logits = vocab.id_to_token.len();
+    let scale = 1.0 / temp;
+
+    let mut logits_id: Vec<(f64, i32)> = Vec::with_capacity(n_logits);
+
+    // 处理 logits，根据 repeat_penalty 进行惩罚
+    for (i, &logit) in logits.iter().enumerate() {
+        let logit = logit as f64 * scale;
+        let adjusted_logit = if last_n_tokens.contains(&(i as i32)) {
+            if logit < 0.0 {
+                logit * repeat_penalty
+            } else {
+                logit / repeat_penalty
+            }
+        } else {
+            logit
+        };
+        logits_id.push((adjusted_logit, i as i32));
+    }
+
+    // 选择 top_k 最高概率的 token
+    sample_top_k(&mut logits_id, top_k);
+
+    // 计算 softmax 概率
+    let max_logit = logits_id
+        .iter()
+        .map(|(logit, _)| *logit)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    let mut probs: Vec<f64> = logits_id
+        .iter()
+        .map(|(logit, _)| (*logit - max_logit).exp())
+        .collect();
+    let sum_probs: f64 = probs.iter().sum();
+
+    // 归一化
+    for p in &mut probs {
+        *p /= sum_probs;
+    }
+
+    // 处理 top_p 采样（截断低概率部分）
+    if top_p < 1.0 {
+        let mut cumulative_sum = 0.0;
+        let mut cutoff_idx = probs.len();
+        for (i, &p) in probs.iter().enumerate() {
+            cumulative_sum += p;
+            if cumulative_sum >= top_p {
+                cutoff_idx = i + 1;
+                break;
+            }
+        }
+
+        probs.truncate(cutoff_idx);
+        logits_id.truncate(cutoff_idx);
+
+        let new_sum: f64 = probs.iter().sum();
+        for p in &mut probs {
+            *p /= new_sum;
+        }
+    }
+
+    // 进行加权随机抽样
+    let dist = WeightedIndex::new(&probs).unwrap();
+    let idx = dist.sample(rng);
+
+    logits_id[idx].1 // 返回选中的 token ID
+}
+
+use rand::prelude::*;
 fn gguf_read() -> LLMResult<()> {
-    let model_path = "/opt/cproject/llama.cpp-gguf-fix-publish/models/llama-2-7b.Q4_0.gguf";
+    let model_path = "/mnt/d/chromedown/DeepSeek-R1-Distill-Llama-8B-Q4_K_M.gguf";
     let file = OpenOptions::new().read(true).open(model_path)?;
     let file_size = file.metadata()?.len();
     let mmap: Mmap = unsafe {
@@ -1977,8 +2378,8 @@ fn gguf_read() -> LLMResult<()> {
     let h = LlamaHparams::load(&gguf_ctx)?;
     let vocab = LLamaVocab::load(&gguf_ctx)?;
 
-    let output = tokenize(&vocab, "what is computer english".to_string(), true)?;
-    println!("{:?}", output);
+    let embd_inp = tokenize(&vocab, "what is computer english".to_string(), true)?;
+    println!("{:?}", embd_inp);
     // let mut output = Vec::new();
     //let mut t = LLMtokenizerSpm::new(&vocab);
     // let mut s = "who am i".to_string();
@@ -1986,7 +2387,7 @@ fn gguf_read() -> LLMResult<()> {
     // replace_all(&mut s, " ", "▁");
     // t.tokenize(&s, &mut output)?;
     // println!("out:{:?}", output);
-    return Ok(());
+    // return Ok(());
 
     let gpu = CudaDevice::new(0)?;
     init_cuda_function(&gpu)?;
@@ -2004,29 +2405,136 @@ fn gguf_read() -> LLMResult<()> {
     let all_pos_1 = 1;
     let all_seq_id = 0;
 
-    let mut pos = vec![0i32; tokens.len()];
-    for i in 0..tokens.len() {
+    let batch = batch_get_one(&tokens, n_batch, 0);
+
+    // return Ok(());
+
+    // let mut pos = vec![0i32; tokens.len()];
+    // for i in 0..tokens.len() {
+    //     pos[i] = all_pos_0 + i as i32 * all_pos_1;
+    // }
+
+    // let mut seq_id = vec![0i32; tokens.len()];
+    // for i in 0..tokens.len() {
+    //     seq_id[i] = all_seq_id;
+    // }
+
+    // let batch = LlamaBatch {
+    //     token: &tokens,
+    //     pos: &pos,
+    //     seq_id: &seq_id,
+    // };
+
+    let mut kv_cache = LlamaKvCache::new(n_ctx);
+
+    let remaining_tokens = 128;
+    let mut input_consumed = 0;
+    let repeat_last_n = 64;
+    let last_n_size = repeat_last_n;
+    let n_batch = 8;
+    let mut input_noecho = false;
+
+    let top_k = 40;
+    let top_p = 0.95f32;
+    let temp = 0.80f32;
+    let repeat_penalty = 1.30f64;
+
+    let mut last_n_tokens = vec![0; last_n_size];
+
+    let mut logits = Vec::new();
+
+    let mut embd = Vec::new();
+
+    let mut remaining_tokens = 128;
+
+    let mut rng = rand::rng();
+    let mut n_past = 0;
+    while remaining_tokens > 0 {
+        // 预测
+        if embd.len() > 0 {
+            let batch = batch_get_one(&embd, n_past, 0);
+            if !kv_cache.llama_kv_cache_find_slot(&batch) {
+                return Ok(());
+            }
+            llama_eval(
+                &model,
+                &batch,
+                &kv_cache,
+                0,
+                &gpu_dev,
+                n_gpu_layer,
+                &mut logits,
+            )
+            .unwrap();
+        }
+        n_past += embd.len() as i32;
+        embd.clear();
+
+        if embd_inp.len() <= input_consumed {
+            let n_vocab = model.hparams.n_vocab as usize;
+            let mut id = 0;
+            {
+                let log_l = logits.len();
+                id = llama_sample_top_p_top_k(
+                    &vocab,
+                    &mut logits[(log_l - n_vocab)..],
+                    &last_n_tokens,
+                    repeat_penalty as f64,
+                    top_k as usize,
+                    top_p as f64,
+                    temp as f64,
+                    &mut rng,
+                );
+                last_n_tokens.remove(0);
+                last_n_tokens.push(id);
+            }
+            embd.push(id);
+            input_noecho = false;
+            remaining_tokens -= 1;
+        } else {
+            //把 emdb_inp 装载进embd
+            while embd_inp.len() > input_consumed {
+                embd.push(embd_inp[input_consumed]);
+                last_n_tokens.remove(0);
+                last_n_tokens.push(embd_inp[input_consumed]);
+                input_consumed += 1;
+                if embd.len() >= n_batch {
+                    break;
+                }
+            }
+        }
+        // display text
+        if !input_noecho {
+            for id in embd.iter() {
+                print!("{}", vocab.id_to_token[*id as usize].str());
+            }
+            io::stdout().flush()?;
+        }
+    }
+
+    Ok(())
+}
+
+fn batch_get_one(token: &[LlamaToken], pos_0: i32, seq_id: i32) -> LlamaBatch {
+    let all_pos_0 = pos_0;
+    let all_pos_1 = 1;
+    let all_seq_id = seq_id;
+    let mut pos = vec![0i32; token.len()];
+    for i in 0..token.len() {
         pos[i] = all_pos_0 + i as i32 * all_pos_1;
     }
 
-    let mut seq_id = vec![0i32; tokens.len()];
-    for i in 0..tokens.len() {
+    let mut seq_id = vec![0i32; token.len()];
+    for i in 0..token.len() {
         seq_id[i] = all_seq_id;
     }
 
     let batch = LlamaBatch {
-        token: tokens,
+        token: token,
         pos: pos,
         seq_id: seq_id,
     };
-
-    let mut kv_cache = LlamaKvCache::new(n_ctx);
-    if !kv_cache.llama_kv_cache_find_slot(&batch) {
-        return Ok(());
-    }
-
-    llama_eval(&model, &batch, &kv_cache, 0, &gpu_dev, n_gpu_layer).unwrap();
-    Ok(())
+    return batch;
 }
 
 fn main() -> LLMResult<()> {

@@ -12,6 +12,8 @@ pub enum LLMError {
     #[error("UnexpectedEof")]
     UnexpectedEof,
     #[error("Unexpected: {0}")]
+    UnexpectedStr(&'static str),
+    #[error("Unexpected: {0}")]
     Unexpected(String),
     #[error("Unexpected IO: {0}")]
     UnexpectIO(IOError),
@@ -53,9 +55,9 @@ impl From<IOError> for LLMError {
     }
 }
 
-impl From<&str> for LLMError {
-    fn from(e: &str) -> Self {
-        LLMError::Unexpected(e.to_string())
+impl From<&'static str> for LLMError {
+    fn from(e: &'static str) -> Self {
+        LLMError::UnexpectedStr(e)
     }
 }
 

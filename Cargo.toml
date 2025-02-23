@@ -11,3 +11,5 @@ lazy_static = "1.2.0"
 galois = {path = "../galois", version = "0.1.0"}
 num-traits = "0.2.15"
 memmap2 = "0.9.0"
+rand = { version = "0.9.0", default-features = false, features = ["alloc", "thread_rng"] } 
+fancy-regex = "0.14.0"
